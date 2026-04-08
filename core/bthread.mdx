@@ -1,0 +1,310 @@
+---
+title: bthread
+description: M:N user-space threading library that multiplexes lightweight bthreads over a fixed pool of pthread workers, enabling high-concurrency services without callback-based programming.
+---
+
+bthread is brpc's M:N threading library. M user-space bthreads are scheduled across N pthread workers (where M >> N), letting you write straightforward synchronous code while the runtime handles context switching without blocking the underlying pthreads.
+
+Unlike N:1 cooperative libraries (coroutines), bthreads can run in parallel across all CPU cores. Unlike raw pthreads, creating thousands of bthreads is cheap — scheduling latency is typically under 3 µs at the median.
+
+<Note>
+bthread APIs can be called from both bthreads and ordinary pthreads. When called from a pthread, the effects apply to the calling pthread rather than a bthread.
+</Note>
+
+## Why bthread
+
+Traditional multi-threaded reactors require blocking worker pthreads while waiting for downstream responses. With hundreds of concurrent requests, this means hundreds of sleeping threads competing for CPU time and polluting CPU caches.
+
+bthread solves this with two key mechanisms:
+
+- **Work-stealing scheduler** — idle pthread workers steal runnable bthreads from busy workers, spreading load across all cores without a global queue bottleneck.
+- **butex** — a synchronization primitive that lets bthreads and pthreads wait for and wake each other. When a bthread blocks on a bthread-aware primitive (mutex, condition variable, RPC), it yields the pthread worker to another runnable bthread instead of sleeping.
+
+## Creating bthreads
+
+```c++
+#include <bthread/bthread.h>
+
+// Signature of the function the bthread will run.
+void* my_func(void* args) {
+    // ... do work ...
+    return nullptr;
+}
+```
+
+Two creation functions differ in scheduling priority of the new bthread:
+
+```c++
+bthread_t tid;
+
+// Schedule the new bthread to run eventually (like pthread_create).
+// Returns 0 on success, errno otherwise.
+int bthread_start_background(bthread_t* __restrict tid,
+                             const bthread_attr_t* __restrict attr,
+                             void* (*fn)(void*),
+                             void* __restrict args);
+
+// Switch to the new bthread immediately, schedule the caller to run later.
+// Use when the new thread is more urgent than the caller.
+// Returns 0 on success, errno otherwise.
+int bthread_start_urgent(bthread_t* __restrict tid,
+                         const bthread_attr_t* __restrict attr,
+                         void* (*fn)(void*),
+                         void* __restrict args);
+```
+
+<Tabs>
+  <Tab title="bthread_start_background">
+    ```c++
+    bthread_t tid;
+    if (bthread_start_background(&tid, nullptr, my_func, nullptr) != 0) {
+        LOG(ERROR) << "Failed to create bthread";
+        return -1;
+    }
+    // Caller continues immediately; my_func runs when a worker is available.
+    bthread_join(tid, nullptr);
+    ```
+  </Tab>
+  <Tab title="bthread_start_urgent">
+    ```c++
+    bthread_t tid;
+    if (bthread_start_urgent(&tid, nullptr, my_func, nullptr) != 0) {
+        LOG(ERROR) << "Failed to create bthread";
+        return -1;
+    }
+    // The new bthread runs first; the caller is rescheduled later.
+    bthread_join(tid, nullptr);
+    ```
+  </Tab>
+</Tabs>
+
+## Your first bthread
+
+<Steps>
+  <Step title="Define the entry function">
+    The function must match the signature `void* fn(void* args)`.
+
+    ```c++
+    struct TaskArgs {
+        int value;
+    };
+
+    void* compute(void* raw_args) {
+        auto* args = static_cast<TaskArgs*>(raw_args);
+        LOG(INFO) << "Processing value: " << args->value;
+        return nullptr;
+    }
+    ```
+  </Step>
+  <Step title="Start the bthread">
+    Pass `nullptr` for the attribute to use defaults (normal priority, joinable).
+
+    ```c++
+    TaskArgs args{42};
+    bthread_t tid;
+    if (bthread_start_background(&tid, nullptr, compute, &args) != 0) {
+        LOG(ERROR) << "bthread_start_background failed";
+        return -1;
+    }
+    ```
+  </Step>
+  <Step title="Join to wait for completion">
+    All bthreads are detached by default but remain joinable. `bthread_join` blocks until the bthread finishes.
+
+    ```c++
+    bthread_join(tid, nullptr);
+    // args is safe to destroy after this point.
+    ```
+  </Step>
+</Steps>
+
+## Joining bthreads
+
+```c++
+// Wait for bthread `bt' to finish. Returns 0 on success, errno otherwise.
+// bthread_return is always set to nullptr (return values are passed via args).
+extern int bthread_join(bthread_t bt, void** bthread_return);
+```
+
+To track and join many bthreads at once:
+
+```c++
+bthread_list_t list;
+bthread_list_init(&list, /*size=*/8, /*conflict_size=*/8);
+
+bthread_t tid1, tid2;
+bthread_start_background(&tid1, nullptr, fn1, nullptr);
+bthread_start_background(&tid2, nullptr, fn2, nullptr);
+bthread_list_add(&list, tid1);
+bthread_list_add(&list, tid2);
+
+bthread_list_join(&list);   // wait for all
+bthread_list_destroy(&list);
+```
+
+## bthread-local storage
+
+bthread provides thread-local storage (TLS) scoped to individual bthreads, similar to POSIX `pthread_key_*`:
+
+```c++
+// Create a key. destructor is called when the bthread exits (may be nullptr).
+extern int bthread_key_create(bthread_key_t* key, void (*destructor)(void*));
+
+// Destroy a key.
+extern int bthread_key_delete(bthread_key_t key);
+
+// Associate value with key in the calling bthread.
+extern int bthread_setspecific(bthread_key_t key, void* value);
+
+// Retrieve the value associated with key in the calling bthread.
+extern void* bthread_getspecific(bthread_key_t key);
+```
+
+Example:
+
+```c++
+static bthread_key_t g_request_id_key;
+
+// Call once at startup.
+bthread_key_create(&g_request_id_key, nullptr);
+
+// Inside a bthread:
+bthread_setspecific(g_request_id_key, reinterpret_cast<void*>(12345UL));
+
+// Later in the same bthread:
+uint64_t id = reinterpret_cast<uint64_t>(bthread_getspecific(g_request_id_key));
+```
+
+## Mutexes and condition variables
+
+bthread provides drop-in replacements for `pthread_mutex_t` and `pthread_cond_t`. Locking a `bthread_mutex_t` from a bthread yields the worker instead of blocking the pthread:
+
+```c++
+// Mutex
+extern int bthread_mutex_init(bthread_mutex_t* mutex,
+                               const bthread_mutexattr_t* attr);
+extern int bthread_mutex_destroy(bthread_mutex_t* mutex);
+extern int bthread_mutex_lock(bthread_mutex_t* mutex);
+extern int bthread_mutex_trylock(bthread_mutex_t* mutex);
+extern int bthread_mutex_unlock(bthread_mutex_t* mutex);
+
+// Condition variable
+extern int bthread_cond_init(bthread_cond_t* cond,
+                              const bthread_condattr_t* cond_attr);
+extern int bthread_cond_destroy(bthread_cond_t* cond);
+extern int bthread_cond_signal(bthread_cond_t* cond);
+extern int bthread_cond_broadcast(bthread_cond_t* cond);
+extern int bthread_cond_wait(bthread_cond_t* cond, bthread_mutex_t* mutex);
+extern int bthread_cond_timedwait(bthread_cond_t* cond,
+                                   bthread_mutex_t* mutex,
+                                   const struct timespec* abstime);
+```
+
+Usage mirrors pthreads:
+
+```c++
+bthread_mutex_t mu;
+bthread_mutex_init(&mu, nullptr);
+
+bthread_mutex_lock(&mu);
+// ... critical section ...
+bthread_mutex_unlock(&mu);
+
+bthread_mutex_destroy(&mu);
+```
+
+## ExecutionQueue
+
+`ExecutionQueue` serializes asynchronous tasks from multiple producers into a single consumer bthread, preserving strict submission order:
+
+```c++
+#include <bthread/execution_queue.h>
+
+// 1. Implement the execute function.
+int my_execute(void* meta, bthread::TaskIterator<MyTask>& iter) {
+    if (iter.is_queue_stopped()) {
+        // Clean up meta here.
+        return 0;
+    }
+    for (; iter; ++iter) {
+        // Process *iter.
+    }
+    return 0;
+}
+
+// 2. Start the queue.
+bthread::ExecutionQueueId<MyTask> queue_id;
+bthread::execution_queue_start(&queue_id, nullptr, my_execute, meta);
+
+// 3. Submit tasks (wait-free, thread-safe).
+MyTask task{...};
+bthread::execution_queue_execute(queue_id, task);
+
+// High-priority task jumps ahead of all pending normal tasks.
+bthread::execution_queue_execute(queue_id, urgent_task,
+                                 &bthread::TASK_OPTIONS_URGENT);
+
+// 4. Stop and join.
+bthread::execution_queue_stop(queue_id);
+bthread::execution_queue_join(queue_id);
+```
+
+<Note>
+`execution_queue_execute` is wait-free. Task submission never blocks the caller regardless of how many tasks are queued.
+</Note>
+
+## bthread vs pthread comparison
+
+<Tabs>
+  <Tab title="bthread">
+    ```c++
+    // Cheap to create — thousands of bthreads is normal.
+    bthread_t tid;
+    bthread_start_background(&tid, nullptr, fn, args);
+
+    // Blocking on bthread primitives yields the worker to other bthreads.
+    bthread_mutex_lock(&mu);
+    bthread_usleep(1000);  // yields worker, doesn't sleep the pthread
+
+    bthread_join(tid, nullptr);
+    ```
+
+    - Creation latency: ~3 µs median
+    - Stack: starts small, grows on demand
+    - Blocking: yields pthread worker to another bthread
+    - Parallelism: M bthreads on N pthreads (M >> N)
+  </Tab>
+  <Tab title="pthread">
+    ```c++
+    // More expensive — hundreds of threads starts to strain the scheduler.
+    pthread_t tid;
+    pthread_create(&tid, nullptr, fn, args);
+
+    // Blocking occupies the OS thread until the lock/sleep is released.
+    pthread_mutex_lock(&mu);
+    usleep(1000);  // blocks the OS thread
+
+    pthread_join(tid, nullptr);
+    ```
+
+    - Creation latency: ~10–50 µs
+    - Stack: fixed size (default 8 MB)
+    - Blocking: sleeps the OS thread
+    - Parallelism: 1:1 with OS threads
+  </Tab>
+</Tabs>
+
+## When NOT to use bthread
+
+<Warning>
+Avoid bthread for these workloads:
+</Warning>
+
+- **CPU-bound tasks with sub-millisecond duration** — bthread scheduling overhead (~3 µs) is non-trivial relative to very short computations.
+- **Long blocking syscalls** (`read`, `write`, `usleep`, `pthread_mutex_lock`) — these block the underlying pthread worker, preventing other bthreads from running on it. If all workers are blocked, RPC I/O stalls. Prefer brpc's async I/O or limit concurrency via `ServerOptions.max_concurrency`.
+- **Parallel RPC fanout** — if you only need to issue multiple RPCs concurrently, use `ParallelChannel` or async callbacks. Launching one bthread per downstream call wastes resources; bthreads are best for parallel CPU work.
+- **Code requiring stable thread identity** — bthreads may migrate across pthreads between suspension points. Code that relies on `pthread_self()` or OS-level TLS being stable will behave unexpectedly.
+
+<Tip>
+As a rule of thumb: use bthread when you need parallel CPU computation inside a single RPC handler. For I/O concurrency, brpc's async channel model is more efficient.
+</Tip>

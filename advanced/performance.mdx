@@ -1,0 +1,128 @@
+---
+title: "Performance"
+description: "I/O model, memory management, and tuning guidance behind bRPC's latency and throughput characteristics."
+---
+
+bRPC is designed to sustain high QPS with low, stable latency under real workloads that include long-tail requests. This page explains the mechanisms that make this possible and how to tune them.
+
+## I/O model
+
+<CardGroup cols={2}>
+  <Card title="Fully parallelized reads" icon="bolt">
+    Reading from different file descriptors is parallelized at the bthread level. A large message on one fd does not delay messages on other fds. Even multiple messages arriving on the same fd are dispatched to separate bthreads and processed concurrently.
+  </Card>
+  <Card title="Wait-free writes" icon="arrow-right">
+    Multiple threads writing to the same fd (common with multiplexed connections) use a wait-free MPSC linked list. The first thread writes in-place; others append to the list atomically. A single fd can sustain 5,000,000 16-byte messages per second under heavy contention.
+  </Card>
+  <Card title="Edge-triggered event dispatch" icon="cpu">
+    `EventDispatcher` (EDISP) uses epoll in edge-triggered mode. After an event arrives, an atomic increment on the fd's counter starts exactly one bthread to drain the fd. The EDISP pthread immediately yields to the new bthread for better cache locality, then gets stolen by another worker — this is bthread work-stealing in practice.
+  </Card>
+  <Card title="Auto-scaling thread count" icon="chart-line">
+    bRPC creates one bthread per request and destroys it when the request completes. There is no fixed thread pool to tune. Thread count rises with load and falls when the service is idle, avoiding the over-provisioning that wastes CPU on context switches.
+  </Card>
+</CardGroup>
+
+### Receiving messages in detail
+
+`InputMessenger` cuts messages from the binary stream using the protocol's `Parse` callback, then dispatches them:
+
+- If `n > 1` messages are ready, `n-1` new bthreads handle the first `n-1` messages; the last message is processed in-place to avoid the overhead of an extra bthread creation.
+- The last successful protocol match is remembered per connection, so protocol detection costs nearly zero on long-lived connections.
+
+### Sending messages in detail
+
+The wait-free write path works as follows:
+
+1. A thread atomically exchanges its write-request node with the list head (`Socket::_write_head`).
+2. If the previous head was empty the thread owns the write and flushes immediately.
+3. Otherwise it chains its node onto the existing list and the writing thread discovers new data before finishing.
+4. When data cannot be flushed in a single call, a `KeepWrite` bthread is started to drain the remainder without blocking the caller.
+
+Because writes always complete quickly, callers return to useful work sooner and `KeepWrite` batches more data per `writev` call at high throughput.
+
+## Minimal lock contention
+
+High-QPS services can utilize all CPU cores because the bRPC hot path avoids global locks:
+
+| Operation | Concurrency technique |
+|---|---|
+| Creating bthreads for new requests | `ResourcePool<TaskMeta>` — per-thread free blocks, global contention only on exhaustion |
+| Setting and expiring timeouts | Timer wheel with per-bucket locks |
+| Correlating responses to RPC contexts | Lock-free id lookup via `bthread_id_t` (version + offset into `ResourcePool`) |
+| Recording performance counters | Per-thread `bvar` aggregation; combined only on read |
+| Socket reference counting | 64-bit `SocketId` with `SetFailed` / `Address` — wait-free read path |
+
+At 500,000+ QPS, the contention profiler typically shows negligible time spent inside bRPC itself.
+
+## Memory management
+
+bRPC uses two fixed-size pool allocators that avoid `malloc` on critical paths:
+
+**`ResourcePool<T>`** allocates objects of type `T` and returns a compact offset (fits in 32 bits) that resolves to a pointer in O(1). The offset forms part of opaque IDs like `SocketId` and `bthread_t`, enabling lock-free existence checks without `shared_ptr` overhead. Per-thread allocation path:
+
+1. Check the thread-local free block. Return immediately if a free slot exists.
+2. Try to claim a free block from the global list.
+3. Allocate a fresh block from the global pool.
+
+**`ObjectPool<T>`** is a simpler variant that returns raw pointers instead of offsets. `Socket::Write` uses `ObjectPool<WriteRequest>` to wrap outgoing request buffers.
+
+Both pools batch allocations and frees to minimize cross-thread coordination.
+
+### IOBuf
+
+`butil::IOBuf` is a non-contiguous buffer made of fixed-size `Block` slices. It supports zero-copy `append`, `cut`, and `move` operations. Protocol parsers, serializers, and RDMA all operate on `IOBuf` directly, eliminating intermediate copies.
+
+### Bthread stacks
+
+Stacks are also pooled by size class:
+
+| Attribute | Default stack size | Use |
+|---|---|---|
+| `BTHREAD_ATTR_NORMAL` | 1 MB | Default for server request handlers |
+| `BTHREAD_ATTR_SMALL` | 32 KB | High-fan-out tasks |
+| `BTHREAD_ATTR_LARGE` | pthread default | Not cached; creation is slower |
+
+Stacks are allocated with `mmap` and protected by a 4 KB guard page.
+
+## Cache-line discipline
+
+bRPC data structures group fields by access frequency to avoid false sharing:
+
+- Use `BAIDU_CACHELINE_ALIGNMENT` (from `butil/macros.h`) on any struct whose fields are written by different threads at high frequency.
+- Hot counters use per-thread `bvar` slots; the global value is only reconstructed when queried.
+- `Socket::_write_head` lives on its own cache line to prevent the wait-free write from polluting adjacent fields.
+
+## Benchmark summary
+
+<Note>
+The following figures come from benchmarks run in 2015 on E5-2620 hardware with Linux 2.6.32. Numbers reflect relative behavior, not absolute limits on modern hardware.
+</Note>
+
+Against `baidu-rpc` (single connection), `ubrpc_mc` (connection pool), `hulu-pbrpc`, `sofa-pbrpc`, `thrift`, and `gRPC`:
+
+- **Throughput vs request size** — bRPC single-connection outperforms all others below 16 KB. With connection pooling (`baidu-rpc_mc`), bRPC reaches 2.3 GB/s on large messages.
+- **Throughput vs thread count** — bRPC scales linearly with thread count up to 256 threads. Most competitors plateau or decline after 8–16 threads.
+- **Latency under long-tail load (1% requests at 5 ms)** — bRPC average latency is unaffected by the slow 1%. gRPC and sofa-pbrpc show 30%+ of normal requests delayed by long-tail requests.
+- **Multi-client → multi-server, two-level fan-out** — bRPC and UB remain stable; hulu-pbrpc becomes unusable at this topology.
+
+## Tuning tips
+
+<Tip>
+Use tcmalloc (link `libtcmalloc_and_profiler.a`) as the default allocator. It reduces per-thread malloc contention significantly compared to glibc malloc. Add `-fno-omit-frame-pointer` to `CXXFLAGS` to preserve call-graph accuracy in profilers.
+</Tip>
+
+<Tip>
+Prefer single connections (`CONNECTION_TYPE_SINGLE`) when accessing one downstream server from many threads. The wait-free write queue handles concurrent writers efficiently, and a single connection uses half the CPU that a connection pool does at the same throughput.
+</Tip>
+
+<Tip>
+Adjust bthread worker count with `-bthread_concurrency`. The default matches the number of CPU cores. Increase it only if your handlers block on non-bthread-aware syscalls (e.g., raw `pthread_mutex_lock`). For pure bRPC workloads the default is optimal.
+</Tip>
+
+<Tip>
+Monitor lock contention at runtime with the contention profiler at `/hotspots/contention`. At high QPS the profiler should show negligible time inside bRPC internals. Large values in user-provided service code indicate opportunities for lock splitting or lock-free data structures.
+</Tip>
+
+<Note>
+Performance test results are highly sensitive to workload shape. Echo benchmarks with no long-tail requests can show 5× higher QPS than realistic mixed workloads on the same hardware. Measure with a representative request distribution before drawing conclusions.
+</Note>

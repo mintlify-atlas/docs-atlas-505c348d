@@ -1,0 +1,276 @@
+---
+title: Load Balancing
+description: How brpc discovers server addresses through naming services and distributes traffic across them using pluggable load-balancing algorithms, including round-robin, locality-aware, and consistent hashing.
+---
+
+brpc separates the concern of **finding servers** (naming service) from **choosing a server** (load balancer). A `Channel` initialized with a cluster URL subscribes to a naming service for the live server list and delegates each RPC to the configured load balancer to pick a target.
+
+```
+NamingService  →  server list  →  LoadBalancer  →  selected server
+                                        ↑
+                              health-check feedback
+```
+
+## Naming services
+
+A naming service maps a URL string to a dynamic list of `host:port` addresses. brpc updates the list periodically or on push notifications from the service.
+
+General URL format: `protocol://service-name`
+
+| URL scheme | Description |
+|---|---|
+| `bns://<bns-name>` | Baidu Naming Service (push-based, ~5 s poll fallback) |
+| `file://<path>` | Newline-separated address file; reloaded on modification |
+| `list://addr1,addr2,...` | Static comma-separated list; never changes |
+| `http://<url>` | DNS; connects all A-record addresses |
+| `https://<url>` | DNS over TLS |
+| `consul://<service-name>` | HashiCorp Consul health-API with long-polling |
+| `nacos://<query>` | Alibaba Nacos Open-API (URL-encoded query string) |
+
+### Connecting to a cluster
+
+```c++
+brpc::Channel channel;
+brpc::ChannelOptions options;
+
+// 3-argument Init: naming service URL + load balancer name.
+if (channel.Init("bns://my.service.all", "rr", &options) != 0) {
+    LOG(ERROR) << "Failed to initialize channel";
+    return -1;
+}
+```
+
+### Naming service filter
+
+Filter the server list before it reaches the load balancer:
+
+```c++
+class MyFilter : public brpc::NamingServiceFilter {
+public:
+    bool Accept(const brpc::ServerNode& server) const override {
+        return server.tag == "main";
+    }
+};
+
+MyFilter my_filter;
+brpc::ChannelOptions options;
+options.ns_filter = &my_filter;
+channel.Init("bns://my.service.all", "rr", &options);
+```
+
+## Built-in load balancers
+
+<CardGroup cols={2}>
+  <Card title="rr — Round Robin" icon="circle-nodes">
+    Cycles through the server list in order: a, b, c, a, b, c, …
+
+    Best when all servers have similar specs and network latency.
+
+    ```c++
+    channel.Init("bns://my.service", "rr", &options);
+    ```
+  </Card>
+  <Card title="random — Random" icon="shuffle">
+    Picks a server uniformly at random on each RPC.
+
+    Statistically equivalent to round-robin at scale; simpler and avoids ordering state.
+
+    ```c++
+    channel.Init("bns://my.service", "random", &options);
+    ```
+  </Card>
+  <Card title="la — Locality-Aware" icon="gauge-high">
+    Tracks observed latency per server and prefers the lowest-latency server, automatically shifting traffic away from slow or overloaded nodes.
+
+    Handles heterogeneous hardware, mixed offline/online deployments, and cross-datacenter traffic without manual weight configuration.
+
+    ```c++
+    channel.Init("bns://my.service", "la", &options);
+    ```
+  </Card>
+  <Card title="c_murmurhash / c_md5 — Consistent Hashing" icon="hashtag">
+    Routes requests with the same key to the same server using a consistent hash ring. Adding or removing servers only remaps a fraction of keys.
+
+    Ideal for cache services where affinity reduces backend load.
+
+    ```c++
+    // Must set request_code on the controller before each RPC.
+    cntl.set_request_code(
+        brpc::policy::MurmurHash32(key.data(), key.size()));
+    channel.Init("bns://my.service", "c_murmurhash", &options);
+    ```
+  </Card>
+  <Card title="wrr — Weighted Round Robin" icon="scale-balanced">
+    Like round-robin but respects per-instance integer weights supplied as tags in the naming service.
+
+    ```c++
+    // In file:// naming service:
+    // 10.0.0.1:8080 50
+    // 10.0.0.2:8080 100
+    channel.Init("file://servers.txt", "wrr", &options);
+    ```
+  </Card>
+  <Card title="wr — Weighted Random" icon="dice">
+    Like random but respects per-instance integer weights.
+
+    ```c++
+    channel.Init("file://servers.txt", "wr", &options);
+    ```
+  </Card>
+</CardGroup>
+
+### Locality-aware load balancing (la)
+
+The `la` algorithm, also called LALB, continuously measures the end-to-end latency of each server and allocates more traffic to faster servers. It solves problems that fixed-weight policies cannot:
+
+- Machines run mixed workloads; available resources change continuously.
+- Latency varies with network path, not just server load.
+- Hybrid deployments where the "nearest" server is not always known.
+
+No configuration is required. Just specify `"la"` as the load balancer name.
+
+### Consistent hashing
+
+Use `c_murmurhash` or `c_md5` when backend servers maintain per-key state (caches, sharded stores) and request affinity reduces backend work.
+
+<Warning>
+You must call `cntl.set_request_code()` before every RPC when using consistent hashing, or the RPC will fail. Hash only the "key" part of the request — do not hash the full payload, because minor changes in non-key fields produce different destinations.
+</Warning>
+
+```c++
+#include <brpc/policy/hasher.h>
+
+std::string key = "user:12345";
+cntl.set_request_code(
+    brpc::policy::MurmurHash32(key.data(), key.size()));
+stub.GetUser(&cntl, &request, &response, nullptr);
+```
+
+### Recovery from cluster downtime
+
+When all servers are unavailable, brpc can throttle the recovery to avoid immediately overloading the first server to come back online:
+
+```c++
+// Accept requests proportionally as servers recover.
+// min_working_instances: minimum servers needed to handle full load.
+// hold_seconds: time to wait at stable q before leaving recovery mode.
+channel.Init("bns://my.service",
+             "random:min_working_instances=6 hold_seconds=10",
+             &options);
+```
+
+## Health checking
+
+When a connection to a server fails, brpc marks it as unhealthy and starts a dedicated bthread that periodically retries the connection. The interval is controlled by the `health_check_interval` flag (default: 3 seconds).
+
+Once the server is reachable again, its socket is revived and the load balancer can select it again. A server is only removed from health checking when it is also removed from the naming service.
+
+```
+Server fails
+    └─ Socket.SetFailed()
+           └─ HealthCheck bthread starts
+                  └─ Retry connection every health_check_interval seconds
+                         └─ Success → Socket.Revive() → back in LoadBalancer
+```
+
+<Note>
+Every server in the load balancer is either healthy (eligible for selection) or under health checking. A server is only completely removed when the naming service stops listing it.
+</Note>
+
+## Writing a custom NamingService or LoadBalancer
+
+<Tabs>
+  <Tab title="Custom NamingService">
+    Implement `brpc::NamingService` and call `actions->ResetServers()` whenever the server list changes. For polling-based sources, inherit from `brpc::PeriodicNamingService` and implement only `GetServers()`:
+
+    ```c++
+    #include <brpc/naming_service.h>
+    #include <brpc/periodic_naming_service.h>
+
+    class MyNamingService : public brpc::PeriodicNamingService {
+    public:
+        // Called periodically. Populate `servers' and return 0 on success.
+        int GetServers(const char* service_name,
+                       std::vector<brpc::ServerNode>* servers) override {
+            servers->clear();
+            // Query your service registry here and push results.
+            brpc::ServerNode node;
+            node.addr = butil::EndPoint(...);
+            node.tag  = "main";
+            servers->push_back(node);
+            return 0;
+        }
+
+        void Describe(std::ostream& os,
+                      const DescribeOptions&) const override {
+            os << "my_naming_service";
+        }
+
+        NamingService* New() const override {
+            return new MyNamingService;
+        }
+        void Destroy() override { delete this; }
+    };
+    ```
+
+    Register in `global.cpp` (or at program startup):
+
+    ```c++
+    brpc::NamingServiceExtension()->RegisterOrDie(
+        "myns", new MyNamingService);
+    // Channel URL: "myns://service-name"
+    ```
+  </Tab>
+  <Tab title="Custom LoadBalancer">
+    Implement `brpc::LoadBalancer`:
+
+    ```c++
+    #include <brpc/load_balancer.h>
+
+    class MyLoadBalancer : public brpc::LoadBalancer {
+    public:
+        // Called when the server list changes.
+        bool AddServer(const brpc::ServerId& id) override { /* ... */ return true; }
+        bool RemoveServer(const brpc::ServerId& id) override { /* ... */ return true; }
+        size_t AddServersInBatch(
+            const std::vector<brpc::ServerId>& servers) override { /* ... */ return servers.size(); }
+        size_t RemoveServersInBatch(
+            const std::vector<brpc::ServerId>& servers) override { /* ... */ return servers.size(); }
+
+        // Called for every RPC. Fill `out->ptr' with the chosen server.
+        int SelectServer(const brpc::SelectIn& in,
+                         brpc::SelectOut* out) override {
+            // Implement your selection logic here.
+            // Return 0 on success, EHOSTDOWN if no server is available.
+            out->ptr = /* chosen SocketId */;
+            return 0;
+        }
+
+        void Feedback(const brpc::CallInfo& info) override {
+            // Optional: update per-server metrics with observed latency.
+        }
+
+        LoadBalancer* New(const butil::StringPiece& params) const override {
+            return new MyLoadBalancer;
+        }
+        void Destroy() override { delete this; }
+        void Describe(std::ostream& os,
+                      const DescribeOptions&) const override {
+            os << "my_lb";
+        }
+    };
+    ```
+
+    Register at startup:
+
+    ```c++
+    brpc::LoadBalancerExtension()->RegisterOrDie(
+        "my_lb", new MyLoadBalancer);
+    // Usage: channel.Init("bns://...", "my_lb", &options);
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+The `DoublyBufferedData` utility (used internally by LALB) is the recommended way to make load-balancer state updates lock-free. Readers never block writers and vice versa. See `src/brpc/load_balancer.h` and `docs/en/lalb.md` for details.
+</Tip>

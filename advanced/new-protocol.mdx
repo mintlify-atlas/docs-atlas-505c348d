@@ -1,0 +1,286 @@
+---
+title: "Adding a new protocol"
+description: "How bRPC supports multiple protocols on one port and how to implement and register a custom protocol."
+---
+
+bRPC servers handle all protocols on the same port. At parse time the framework tries protocols in sequence until one matches, then routes incoming messages to `process_request` on the server side or `process_response` on the client side.
+
+## Protocol categories
+
+bRPC classifies protocols into three tiers to make single-port multiplexing unambiguous:
+
+<CardGroup cols={1}>
+  <Card title="First-class protocols">
+    Distinguished by a fixed magic prefix in the first bytes of every message. `baidu_std` starts with `PRPC`; `hulu_pbrpc` starts with `HULU`. The parser checks the first four bytes and either accepts or rejects immediately. All first-class protocols can share a single TCP connection.
+  </Card>
+  <Card title="Second-class protocols">
+    Have no fixed prefix and require parsing several bytes before a match can be confirmed. HTTP is the only current member of this class.
+  </Card>
+  <Card title="Third-class protocols">
+    Carry magic bytes at an offset inside the frame rather than at position 0. `nshead` places its magic number at bytes 25–28. The parser must read at least 28 bytes before it can decide, so these protocols are tried last to avoid misclassifying short HTTP messages as incomplete `nshead` frames.
+  </Card>
+</CardGroup>
+
+Because most connections carry a single protocol, bRPC remembers the last successful match and tries it first on subsequent reads, reducing per-message matching overhead to nearly zero on long-lived connections.
+
+## Protocol struct
+
+Every protocol is described by `brpc::Protocol`, defined in `src/brpc/protocol.h`:
+
+```c++
+struct Protocol {
+    // [Required by both client and server]
+    typedef ParseResult (*Parse)(butil::IOBuf* source, Socket* socket,
+                                 bool read_eof, const void* arg);
+    Parse parse;
+
+    // [Required by client]
+    typedef void (*SerializeRequest)(butil::IOBuf* request_buf,
+                                     Controller* cntl,
+                                     const google::protobuf::Message* request);
+    SerializeRequest serialize_request;
+
+    // [Required by client]
+    typedef void (*PackRequest)(butil::IOBuf* iobuf_out,
+                                SocketMessage** user_message_out,
+                                uint64_t correlation_id,
+                                const google::protobuf::MethodDescriptor* method,
+                                Controller* controller,
+                                const butil::IOBuf& request_buf,
+                                const Authenticator* auth);
+    PackRequest pack_request;
+
+    // [Required by server]
+    typedef void (*ProcessRequest)(InputMessageBase* msg);
+    ProcessRequest process_request;
+
+    // [Required by client]
+    typedef void (*ProcessResponse)(InputMessageBase* msg);
+    ProcessResponse process_response;
+
+    // [Required by authenticating server]
+    typedef bool (*Verify)(const InputMessageBase* msg);
+    Verify verify;
+
+    // [Optional] convert server_addr_and_port to butil::EndPoint
+    typedef bool (*ParseServerAddress)(butil::EndPoint* out,
+                                       const char* server_addr_and_port);
+    ParseServerAddress parse_server_address;
+
+    // [Optional] customize method name
+    typedef const std::string& (*GetMethodName)(
+        const google::protobuf::MethodDescriptor* method,
+        const Controller*);
+    GetMethodName get_method_name;
+
+    // Bitwise-or of supported ConnectionType values
+    ConnectionType supported_connection_type;
+
+    // Short string constant used in configuration and logs
+    const char* name;
+};
+```
+
+`support_client()` returns `true` when `serialize_request`, `pack_request`, and `process_response` are all set. `support_server()` returns `true` when `process_request` is set.
+
+Predefined `ConnectionType` constants:
+
+```c++
+// Pooled + short connections only
+const ConnectionType CONNECTION_TYPE_POOLED_AND_SHORT = ...;
+
+// All three connection types
+const ConnectionType CONNECTION_TYPE_ALL = ...;
+```
+
+## Callback reference
+
+### `parse`
+
+```c++
+typedef ParseResult (*Parse)(butil::IOBuf* source, Socket* socket,
+                             bool read_eof, const void* arg);
+```
+
+Cuts one message from `source`. Shared by client and server. The returned message is passed to `process_request` or `process_response` and destroyed by `InputMessenger`.
+
+Possible return values:
+
+| Return value | Meaning |
+|---|---|
+| `PARSE_ERROR_TRY_OTHERS` | Protocol not matched; data must not be consumed. |
+| `PARSE_ERROR_NOT_ENOUGH_DATA` | Partial message; wait for more bytes. Data may be consumed if the protocol is already confirmed. |
+| `PARSE_ERROR_TOO_BIG_DATA` | Message exceeds the size limit; connection will be closed. |
+| `PARSE_ERROR_NO_RESOURCE` | Internal allocation failure; connection will be closed. |
+| `PARSE_ERROR_ABSOLUTELY_WRONG` | Magic matched but format is invalid; connection will be closed. |
+
+### `serialize_request`
+
+```c++
+typedef void (*SerializeRequest)(butil::IOBuf* request_buf,
+                                 Controller* cntl,
+                                 const google::protobuf::Message* request);
+```
+
+Serializes the user's request into `request_buf`. Called once per RPC before sending. Call `cntl->SetFailed()` on error.
+
+### `pack_request`
+
+```c++
+typedef void (*PackRequest)(butil::IOBuf* iobuf_out,
+                            SocketMessage** user_message_out,
+                            uint64_t correlation_id,
+                            const google::protobuf::MethodDescriptor* method,
+                            Controller* controller,
+                            const butil::IOBuf& request_buf,
+                            const Authenticator* auth);
+```
+
+Wraps `request_buf` into a wire frame. Called before every send, including retries. Pack authentication data when `auth` is not `NULL`.
+
+### `process_request`
+
+```c++
+typedef void (*ProcessRequest)(InputMessageBase* msg_base);
+```
+
+Handles a parsed request on the server side. May run in a different thread from `parse`. Multiple invocations run concurrently. You **must** call `msg_base->Destroy()` when done; use `DestroyingPtr<>` from `destroyable.h` to ensure this even on error paths.
+
+### `process_response`
+
+```c++
+typedef void (*ProcessResponse)(InputMessageBase* msg);
+```
+
+Handles a parsed response on the client side. Same threading and ownership rules as `process_request`.
+
+### `verify`
+
+```c++
+typedef bool (*Verify)(const InputMessageBase* msg);
+```
+
+Authenticates the connection using the first received message. Return `true` on success. Can be `NULL` when authentication is not needed.
+
+### `parse_server_address`
+
+```c++
+typedef bool (*ParseServerAddress)(butil::EndPoint* out,
+                                   const char* server_addr_and_port);
+```
+
+Converts a `Channel::Init` address string to `butil::EndPoint`. Optional; only needed when your protocol uses a non-standard address format.
+
+### `get_method_name`
+
+```c++
+typedef const std::string& (*GetMethodName)(
+    const google::protobuf::MethodDescriptor* method,
+    const Controller*);
+```
+
+Returns a custom method name string. Optional.
+
+## Adding a new protocol
+
+<Warning>
+Adding a new `ProtocolType` value to `options.proto` requires coordination with the bRPC maintainers to avoid conflicts with other organizations' protocols. Open an issue or pull request rather than assigning a value locally.
+</Warning>
+
+<Steps>
+  <Step title="Add a ProtocolType">
+    Open `src/brpc/options.proto` and add a new enum value in `ProtocolType`. Existing values for reference:
+
+    ```protobuf
+    enum ProtocolType {
+        PROTOCOL_UNKNOWN        = 0;
+        PROTOCOL_BAIDU_STD      = 1;
+        PROTOCOL_STREAMING_RPC  = 2;
+        PROTOCOL_HULU_PBRPC     = 3;
+        PROTOCOL_SOFA_PBRPC     = 4;
+        PROTOCOL_RTMP           = 5;
+        PROTOCOL_HTTP           = 6;
+        PROTOCOL_PUBLIC_PBRPC   = 7;
+        PROTOCOL_NOVA_PBRPC     = 8;
+        PROTOCOL_NSHEAD         = 10;
+        PROTOCOL_MONGO          = 13;  // server side only
+        PROTOCOL_REDIS          = 16;  // client side only
+        PROTOCOL_MEMCACHE       = 17;  // client side only
+        PROTOCOL_THRIFT         = 25;  // server side only
+        // ... add your value here
+    }
+    ```
+  </Step>
+  <Step title="Implement the callbacks">
+    Create your implementation files under `src/brpc/policy/`. Study an existing protocol such as `baidu_rpc_protocol.cpp` or `http_rpc_protocol.cpp` for reference.
+
+    At minimum you must implement:
+    - `Parse` (required for both sides)
+    - `ProcessRequest` (server side)
+    - `SerializeRequest` + `PackRequest` + `ProcessResponse` (client side)
+
+    Implement `Verify` if your server requires authentication.
+  </Step>
+  <Step title="Register the protocol">
+    Call `brpc::RegisterProtocol` in `src/brpc/global.cpp` during framework initialization. The HTTP registration serves as a complete example:
+
+    ```c++
+    Protocol http_protocol = { ParseHttpMessage,
+                               SerializeHttpRequest, PackHttpRequest,
+                               ProcessHttpRequest, ProcessHttpResponse,
+                               VerifyHttpRequest, ParseHttpServerAddress,
+                               GetHttpMethodName,
+                               CONNECTION_TYPE_POOLED_AND_SHORT,
+                               "http" };
+    if (RegisterProtocol(PROTOCOL_HTTP, http_protocol) != 0) {
+        exit(1);
+    }
+    ```
+
+    The `name` field (`"http"` above) appears in logs, built-in service pages, and flags output, so keep it short and lowercase.
+  </Step>
+</Steps>
+
+## Existing protocol implementations
+
+The `src/brpc/policy/` directory contains all bundled protocol implementations. Use them as starting points:
+
+| File | Protocol |
+|---|---|
+| `baidu_rpc_protocol.cpp` | `baidu_std` — bRPC's primary binary protocol |
+| `http_rpc_protocol.cpp` | HTTP/1.x |
+| `http2_rpc_protocol.cpp` | HTTP/2 and gRPC |
+| `hulu_pbrpc_protocol.cpp` | hulu_pbrpc |
+| `redis_protocol.cpp` | Redis (client side only) |
+| `memcache_binary_protocol.cpp` | Memcache binary protocol (client side only) |
+| `thrift_protocol.cpp` | Apache Thrift (server side only) |
+| `nshead_protocol.cpp` | nshead-based protocols |
+| `rtmp_protocol.cpp` | RTMP streaming |
+
+<Note>
+Protocols whose messages start with `nshead` have unified support. See the nshead service documentation rather than implementing a custom parser from scratch.
+</Note>
+
+## Utility functions
+
+bRPC exposes several helpers for protocol implementers:
+
+```c++
+// Common serialize_request used by many protocols
+void SerializeRequestDefault(butil::IOBuf* buf,
+                             Controller* cntl,
+                             const google::protobuf::Message* request);
+
+// Parse protobuf messages respecting -max_body_size
+bool ParsePbFromIOBuf(google::protobuf::Message* msg, const butil::IOBuf& buf);
+bool ParsePbFromArray(google::protobuf::Message* msg,
+                      const void* data, size_t size);
+bool ParsePbFromString(google::protobuf::Message* msg, const std::string& str);
+```
+
+## Thread-safety guarantees
+
+- `RegisterProtocol` is thread-safe.
+- `FindProtocol` is thread-safe.
+- `parse` and `process_request`/`process_response` may run on different threads for the same connection.
+- Multiple `process_request` invocations run concurrently; your implementation must be reentrant.

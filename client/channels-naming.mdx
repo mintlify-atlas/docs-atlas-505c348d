@@ -1,0 +1,286 @@
+---
+title: "Channels, Naming & Load Balancing"
+description: "Connect bRPC channels to clusters using naming services and load balancers. Covers bns://, file://, list://, http://, round-robin, locality-aware, consistent hashing, health checking, and connection types."
+---
+
+# Channels, Naming & Load Balancing
+
+When connecting to a cluster of servers rather than a single endpoint, use the three-argument form of `Channel::Init()`:
+
+```c++
+int Init(const char* naming_service_url,
+         const char* load_balancer_name,
+         const ChannelOptions* options);
+```
+
+The channel periodically (or on push notification) fetches a list of servers from the naming service and routes each RPC to one server according to the load balancing algorithm.
+
+<Warning>
+Do **not** create such channels ad-hoc before each RPC. Channel creation involving a naming service is expensive — it must contact the naming service at least once to discover server candidates. Create cluster channels at startup and share them.
+</Warning>
+
+---
+
+## Naming Service URLs
+
+The general form is `protocol://service_name`. The naming service resolves this name to a live list of `host:port` endpoints, which the channel tracks.
+
+<Tabs>
+  <Tab title="bns://">
+    BNS (Baidu Naming Service) — the most common internal naming service at Baidu.
+
+    ```c++
+    channel.Init("bns://rdev.matrix.all", "rr", &options);
+    ```
+
+    If the channel reports "no servers" but the BNS directory is non-empty, check the status bits of the BNS nodes:
+
+    ```bash
+    get_instance_by_service [bns_node_name] -s
+    ```
+
+    A non-zero status bit means the server is marked unavailable and excluded from candidate lists.
+  </Tab>
+
+  <Tab title="file://">
+    Read a list of servers from a local file. brpc reloads the file automatically when it changes on disk.
+
+    ```
+    # This line is ignored
+    10.24.234.17:8080 tag1  # a comment
+    10.24.234.17:8090 tag2  # different tag = different instance
+    10.24.234.18:8080
+    10.24.234.19:8080
+    ```
+
+    ```c++
+    channel.Init("file://conf/machine_list", "rr", &options);
+    ```
+
+    Each line is a server address. Contents after `#` are comments. Text after the address (separated by spaces) is a tag — same address with different tags are treated as distinct instances.
+
+    Good for unit tests and manual deployments. Not suitable for production clusters where the list changes dynamically.
+  </Tab>
+
+  <Tab title="list://">
+    Embed the server list directly in the URL, separated by commas:
+
+    ```c++
+    channel.Init(
+        "list://10.0.0.1:7000,10.0.0.2:7000,10.0.0.3:7000",
+        "rr", &options);
+    ```
+
+    Cannot be changed at runtime. Good for quick experiments and tests.
+  </Tab>
+
+  <Tab title="http://">
+    Connect to all servers under a DNS domain:
+
+    ```c++
+    channel.Init("http://www.baidu.com:80", "rr", &options);
+    ```
+
+    Unlike single-server `Init()` which resolves the DNS name once, this form connects to all A-record addresses returned by DNS. Use `https://` for SSL-encrypted connections.
+
+    Limited by DNS — no push-based update notification.
+  </Tab>
+
+  <Tab title="consul://">
+    Discover servers via HashiCorp Consul's health API:
+
+    ```c++
+    channel.Init("consul://my-service-name", "rr", &options);
+    ```
+
+    Uses long-polling by default to receive updates when the server list changes. Consul address defaults to `localhost:8500`; override with `-consul_agent_addr`.
+
+    Can be automatically downgraded to `file://` naming if Consul is unreachable (set `-consul_enable_degrade_to_file_naming_service`).
+  </Tab>
+
+  <Tab title="nacos://">
+    Discover servers from Nacos using its Open-API:
+
+    ```c++
+    // service_name is a URL-encoded query string
+    channel.Init(
+        "nacos://serviceName=test&groupName=g&namespaceId=n",
+        "rr", &options);
+    ```
+
+    Configure the Nacos address with `-nacos_address`. Supports simple username/password authentication via `-nacos_username` and `-nacos_password`.
+  </Tab>
+</Tabs>
+
+---
+
+## Load Balancers
+
+<CardGroup cols={2}>
+  <Card title="rr — Round Robin" icon="arrows-rotate">
+    Sends requests to servers in order: a, b, c, a, b, c… Best when all servers have similar specs, latencies, and load.
+  </Card>
+  <Card title="wrr — Weighted Round Robin" icon="weight-hanging">
+    Each server is selected proportionally to its integer weight tag. Set `tag="50"` on instances in the naming service. Useful for heterogeneous hardware.
+  </Card>
+  <Card title="random — Random" icon="shuffle">
+    Picks a server at random each time. Like `rr`, assumes servers are similar. Simpler than round-robin and works well at scale.
+  </Card>
+  <Card title="wr — Weighted Random" icon="dice">
+    Weighted variant of random. Same tag format as `wrr`.
+  </Card>
+  <Card title="la — Locality-Aware" icon="gauge-high">
+    Prefers servers with lower measured latency. Automatically shifts traffic away from slow servers.
+  </Card>
+  <Card title="c_murmurhash / c_md5 — Consistent Hashing" icon="fingerprint">
+    Deterministically routes requests with the same key to the same server. Minimizes remapping when servers are added or removed. Ideal for cache backends.
+  </Card>
+</CardGroup>
+
+### Consistent Hashing Setup
+
+Consistent hashing requires you to set a `request_code` derived from the key part of your request **before** calling:
+
+```c++
+#include <brpc/policy/hasher.h>
+
+// Compute request_code from the key field, not the full request.
+std::string key = request.user_id();
+cntl.set_request_code(brpc::policy::MurmurHash32(key.data(), key.size()));
+
+stub.SomeMethod(&cntl, &request, &response, NULL);
+```
+
+<Warning>
+Only hash the **key** portion of the request — not fields like timestamps or padding. A minor change in attributes should not reroute a request to a different server.
+</Warning>
+
+### Recovery from Cluster Downtime
+
+When an entire cluster goes down, servers come back online one by one. Without throttling, all traffic floods the first server that recovers, potentially bringing it back down before others are ready.
+
+Enable client-side recovery throttling by appending parameters to the load balancer name:
+
+```c++
+channel.Init("http://...",
+             "random:min_working_instances=6 hold_seconds=10",
+             &options);
+```
+
+During recovery, a fraction `q / min_working_instances` of requests are accepted (where `q` is the current number of healthy servers). If `q` stays stable for `hold_seconds`, all traffic resumes. Only valid for `rr` and `random`.
+
+---
+
+## Naming Service Tags and Filters
+
+Every server address in a naming service can carry a **tag** — text after the address, separated by spaces:
+
+```
+10.0.0.1:8080 main
+10.0.0.2:8080 canary
+```
+
+Same address + different tag = two distinct channel instances with separate connections. You can filter by tag using `NamingServiceFilter`:
+
+```c++
+class MyNamingServiceFilter : public brpc::NamingServiceFilter {
+public:
+    bool Accept(const brpc::ServerNode& server) const {
+        return server.tag == "main";
+    }
+};
+
+int main() {
+    MyNamingServiceFilter my_filter;
+    brpc::ChannelOptions options;
+    options.ns_filter = &my_filter;
+    channel.Init("bns://my-service", "rr", &options);
+}
+```
+
+---
+
+## Health Checking and Circuit Breaker
+
+When a connection to a server is lost, that server is **isolated** from the load balancer temporarily. brpc reconnects to isolated servers on a regular interval (default 3 seconds, controlled by `-health_check_interval`) and restores them to the candidate pool once the connection succeeds.
+
+```
+# Gflag
+-health_check_interval=3   # seconds between health-check attempts
+```
+
+Once removed from the naming service, a server is also removed from health checking.
+
+**Circuit breaker** (enabled via `ChannelOptions.enable_circuit_breaker`) goes further: it isolates servers whose *error rate* is too high, even if the connection is still alive. The isolation is process-wide — all channels in the process are affected.
+
+```c++
+brpc::ChannelOptions options;
+options.enable_circuit_breaker = true;
+channel.Init("bns://my-service", "rr", &options);
+```
+
+---
+
+## Connection Types
+
+brpc supports three connection strategies, each with different performance characteristics:
+
+| | Short | Pooled | Single |
+|---|---|---|---|
+| Long connection | No | Yes | Yes |
+| Connections per server (from one client) | qps × latency | qps × latency | 1 |
+| Peak QPS | Low | Medium | High |
+| Latency | 1.5RTT + proc | 1RTT + proc | 1RTT + proc |
+| CPU overhead | High (connect each RPC) | Medium | Low (batched writes) |
+
+Configure via `ChannelOptions.connection_type`:
+
+```c++
+options.connection_type = "single";  // or "pooled", "short"
+```
+
+Leave it empty to use the protocol's default (recommended):
+- `baidu_std`, `hulu_pbrpc`, `sofa_pbrpc` default to **single**
+- `http/1.1`, nshead-based protocols default to **pooled** (Keep-Alive)
+- No protocol defaults to **short**
+
+### VIP / Layer-4 Load Balancer Considerations
+
+If clients connect through a VIP (virtual IP):
+- **Single connection** sends all traffic from one client to one backend RS. Works fine with many clients, but may cause hotspots with few clients.
+- **Pooled connection** spreads traffic across multiple backend RSes per VIP. Use `wrr` or per-VIP tags to balance across multiple VIPs.
+
+### Idle Connection Cleanup
+
+Pooled connections unused for `-idle_timeout_second` seconds (default 10) are closed automatically:
+
+```
+-idle_timeout_second=10        # seconds before closing idle pooled connections
+-log_idle_connection_close=false  # set true to log each closure
+```
+
+### Deferred Connection Close
+
+When channels are short-lived, connections may be closed and reopened frequently. Set `-defer_close_second` to delay closing connections after the last channel releases them:
+
+```
+-defer_close_second=5  # keep connections alive 5s after last channel drops them
+```
+
+---
+
+## Unifying Single-Server and Cluster Init
+
+You can use the three-argument `Init()` for both cases by leaving `load_balancer_name` empty for single servers:
+
+```c++
+// Cluster:
+channel.Init("bns://my-cluster", "rr", &options);
+
+// Single server (same API, empty LB name):
+channel.Init("10.0.0.1:8080", "", &options);
+
+// Or, read both from config at runtime:
+channel.Init(naming_url.c_str(), lb_name.c_str(), &options);
+// If lb_name is empty, naming_url is treated as "host:port".
+```

@@ -1,0 +1,275 @@
+---
+title: "Quickstart: server"
+description: "Define a proto service, implement it in C++, register it with brpc::Server, and run it—using the echo example from the bRPC repository."
+---
+
+This guide walks through building the canonical echo server included in `example/echo_c++/`. The full source is at [`example/echo_c++/server.cpp`](https://github.com/apache/brpc/blob/master/example/echo_c%2B%2B/server.cpp).
+
+<Steps>
+  <Step title="Define the .proto file">
+    Service interfaces, request types, and response types are defined in a `.proto` file. The `cc_generic_services = true` option instructs `protoc` to generate abstract C++ base classes that bRPC can dispatch to.
+
+    ```protobuf echo.proto
+    syntax = "proto2";
+    package example;
+
+    option cc_generic_services = true;
+
+    message EchoRequest {
+        required string message = 1;
+    };
+
+    message EchoResponse {
+        required string message = 1;
+    };
+
+    service EchoService {
+        rpc Echo(EchoRequest) returns (EchoResponse);
+    };
+    ```
+
+    Running `protoc --cpp_out=. echo.proto` generates `echo.pb.h` and `echo.pb.cc`, which contain the `EchoService` abstract base class your implementation will subclass.
+
+    <Note>
+      bRPC is compatible with protobuf 3.0–5.29. bRPC 1.8.0 and later require protobuf 3.x or later and are not compatible with protobuf 2.x.
+    </Note>
+  </Step>
+
+  <Step title="Implement the service">
+    Subclass the generated `EchoService` and override each RPC method. The method signature is fixed by the generated base class.
+
+    ```c++ server.cpp
+    #include <gflags/gflags.h>
+    #include <butil/logging.h>
+    #include <brpc/server.h>
+    #include "echo.pb.h"
+
+    namespace example {
+
+    class EchoServiceImpl : public EchoService {
+    public:
+        EchoServiceImpl() {}
+        virtual ~EchoServiceImpl() {}
+
+        virtual void Echo(google::protobuf::RpcController* cntl_base,
+                          const EchoRequest* request,
+                          EchoResponse* response,
+                          google::protobuf::Closure* done) {
+            // ClosureGuard calls done->Run() automatically when it goes out
+            // of scope, whether the function exits normally or via an early
+            // return. This is the recommended pattern for synchronous services.
+            brpc::ClosureGuard done_guard(done);
+
+            brpc::Controller* cntl =
+                static_cast<brpc::Controller*>(cntl_base);
+
+            LOG(INFO) << "Received request[log_id=" << cntl->log_id()
+                      << "] from " << cntl->remote_side()
+                      << ": " << request->message();
+
+            // Fill the response.
+            response->set_message(request->message());
+        }
+    };
+
+    }  // namespace example
+    ```
+
+    **Parameters explained:**
+
+    | Parameter | Description |
+    |---|---|
+    | `cntl_base` | Cast to `brpc::Controller*` to access bRPC-specific metadata (remote address, log ID, attachments, etc.) |
+    | `request` | Read-only message sent by the client |
+    | `response` | Filled by your implementation; if a `required` field is left unset, the RPC fails |
+    | `done` | Callback created by the framework. **Must be called exactly once.** It validates, serializes, and sends the response. |
+
+    ### ClosureGuard
+
+    `brpc::ClosureGuard` is an RAII wrapper that calls `done->Run()` when it is destructed. Using it eliminates the common bug of forgetting a `done->Run()` call on an error path.
+
+    ```c++
+    // Interface of ClosureGuard
+    class ClosureGuard {
+    public:
+        explicit ClosureGuard(google::protobuf::Closure* done);
+        ~ClosureGuard();                        // calls done->Run() if not released
+        void reset(google::protobuf::Closure* done);
+        google::protobuf::Closure* release();   // detaches done; destructor becomes a no-op
+    };
+    ```
+
+    ### Synchronous vs. asynchronous handling
+
+    For a **synchronous service**, keep `done_guard` alive until the end of the method—the default behavior:
+
+    ```c++
+    void SyncFoo(..., google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        // Process request. done->Run() is called when done_guard is destructed.
+    }
+    ```
+
+    For an **asynchronous service**, the request is not fully processed when `CallMethod` returns. Call `done_guard.release()` to prevent `done->Run()` from being called on exit, then call it yourself (or store `done` and call it later) when processing is complete:
+
+    ```c++
+    void AsyncFoo(..., google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        // Store done and start async work...
+        async_processor->Submit(request, response, done_guard.release());
+        // done->Run() will be called by async_processor when complete.
+    }
+    ```
+
+    <Warning>
+      `done->Run()` must be called exactly once for every RPC. Calling it zero times causes the client to wait forever; calling it more than once corrupts memory.
+    </Warning>
+
+    ### Failing an RPC
+
+    Call `Controller::SetFailed()` to signal an error to the client. The framework sends the error text instead of the response message:
+
+    ```c++
+    cntl->SetFailed("something went wrong");
+    return; // done_guard calls done->Run() on exit
+    ```
+
+    On the client side, `controller.Failed()` returns `true` and `controller.ErrorText()` contains the message.
+  </Step>
+
+  <Step title="Create and start the server">
+    In `main()`, instantiate `brpc::Server`, register your service implementation, configure `ServerOptions`, and call `Start()`.
+
+    ```c++
+    DEFINE_int32(port, 8000, "TCP port of this server");
+    DEFINE_int32(idle_timeout_s, -1, "Close connections idle for this many seconds");
+
+    int main(int argc, char* argv[]) {
+        GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+
+        brpc::Server server;
+
+        // The service instance lives on the stack. Using
+        // SERVER_DOESNT_OWN_SERVICE tells the server not to delete it.
+        example::EchoServiceImpl echo_service_impl;
+
+        if (server.AddService(&echo_service_impl,
+                              brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+            LOG(ERROR) << "Fail to add service";
+            return -1;
+        }
+
+        // Configure server options.
+        brpc::ServerOptions options;
+        options.idle_timeout_sec = FLAGS_idle_timeout_s;
+
+        // Start listening on the specified port.
+        if (server.Start(FLAGS_port, &options) != 0) {
+            LOG(ERROR) << "Fail to start EchoServer";
+            return -1;
+        }
+
+        // Block until Ctrl-C, then cleanly stop and join.
+        server.RunUntilAskedToQuit();
+        return 0;
+    }
+    ```
+
+    ### AddService
+
+    ```c++
+    int AddService(google::protobuf::Service* service, ServiceOwnership ownership);
+    ```
+
+    `ownership` controls whether the server deletes the service on shutdown:
+
+    - `brpc::SERVER_DOESNT_OWN_SERVICE` — service is managed by the caller (stack or smart pointer).
+    - `brpc::SERVER_OWNS_SERVICE` — server deletes the service on destruction.
+
+    Services cannot be added or removed after `Start()` is called.
+
+    ### Start overloads
+
+    ```c++
+    int Start(int port, const ServerOptions* opt);
+    int Start(const char* ip_and_port_str, const ServerOptions* opt);
+    int Start(EndPoint ip_and_port, const ServerOptions* opt);
+    ```
+
+    Pass `NULL` for `opt` to use all default values.
+
+    ### ServerOptions reference
+
+    | Field | Default | Description |
+    |---|---|---|
+    | `num_threads` | CPU core count | Number of worker pthreads (hint only; shared across all servers in the process) |
+    | `max_concurrency` | 0 (unlimited) | Maximum number of requests processed simultaneously. Excess requests receive `ELIMIT`. |
+    | `idle_timeout_sec` | -1 (disabled) | Close connections with no activity for this many seconds |
+    | `internal_port` | -1 (disabled) | Secondary port for built-in services, inaccessible from the public port |
+    | `has_builtin_services` | `true` | Set `false` to disable `/status`, `/vars`, `/rpcz`, etc. |
+
+    ### Limiting per-method concurrency
+
+    After `AddService` and before `Start`, set per-method limits:
+
+    ```c++
+    server.MaxConcurrencyOf("example.EchoService.Echo") = 10;
+    // equivalently:
+    server.MaxConcurrencyOf(&echo_service_impl, "Echo") = 10;
+    ```
+
+    To let bRPC compute the limit automatically based on observed latency and throughput (Little's Law):
+
+    ```c++
+    server.MaxConcurrencyOf("example.EchoService.Echo") = "auto";
+    ```
+
+    ### Stopping the server
+
+    `RunUntilAskedToQuit()` blocks until SIGINT or SIGTERM, then calls `Stop()` and `Join()`. To control shutdown manually:
+
+    ```c++
+    server.Stop(0);  // non-blocking; signals the server to stop accepting new requests
+    server.Join();   // blocks until all in-flight requests complete
+    ```
+  </Step>
+
+  <Step title="Build and run">
+    <Tabs>
+      <Tab title="Make">
+        ```bash
+        cd example/echo_c++
+        make
+        ./echo_server &
+        ./echo_client
+        ```
+      </Tab>
+      <Tab title="CMake">
+        ```bash
+        cd example/echo_c++
+        cmake -B build && cmake --build build -j4
+        ./echo_server &
+        ./echo_client
+        ```
+      </Tab>
+    </Tabs>
+
+    Expected output from the client:
+
+    ```
+    I0101 00:00:00.000000 12345 client.cpp:83] Received response from 0.0.0.0:8000 to ...
+    : hello world (attached=) latency=123us
+    ```
+
+    The server is also accessible via HTTP because bRPC auto-negotiates protocols:
+
+    ```bash
+    curl -d '{"message":"hello"}' http://localhost:8000/EchoService/Echo
+    # {"message":"hello"}
+    ```
+
+    <Tip>
+      Built-in observability endpoints are available at `http://localhost:8000/status`, `http://localhost:8000/vars`, and `http://localhost:8000/rpcz` while the server is running.
+    </Tip>
+  </Step>
+</Steps>

@@ -1,0 +1,258 @@
+---
+title: bvar
+description: Thread-local storage based lock-free metrics library for multi-threaded applications, providing near-zero write overhead regardless of thread count.
+---
+
+bvar is brpc's metrics collection library. It stores counter values in thread-local storage (TLS) so that writes from different threads never contend with each other. Reads are slower — they combine all per-thread data — but reads are infrequent (logging, monitoring dashboards) while writes happen on every request.
+
+The key insight: move contention from write time to read time.
+
+## Why bvar
+
+On a 24-thread workload, a naive atomic counter degrades to ~300 ns per increment due to cache-line bouncing. bvar keeps write overhead at ~20 ns and flat across any number of threads.
+
+| Counter type | Overhead at 24 threads |
+|---|---|
+| bvar | ~20 ns (constant) |
+| Atomic increment | ~300 ns |
+| Dynamic UbMonitor | ~7 µs |
+
+When many threads modify a counter, each thread writes into its own per-thread slot. At read time, all slots are summed. This makes bvar unsuitable for counters that are both written and read at high frequency, or where decisions must be made on the latest value.
+
+<Note>
+bvar moves contention from write to read. If you need real-time values for control-flow decisions, use an atomic variable instead.
+</Note>
+
+All exposed bvars in a brpc server are visible at `/vars` and individually addressable at `/vars/VARNAME`. They can also be exported to Prometheus at `/brpc_metrics`.
+
+## bvar types
+
+<Tabs>
+  <Tab title="Adder">
+    Running sum. Each `<< N` adds N to the counter.
+
+    ```c++
+    #include <bvar/bvar.h>
+
+    // Unexposed (not visible in /vars), just a fast counter.
+    bvar::Adder<int> error_count;
+    error_count << 1;   // += 1
+    error_count << 5;   // += 5
+    int v = error_count.get_value();  // 6
+
+    // Exposed globally — appears in /vars as "my_module_errors".
+    bvar::Adder<int> g_errors("my_module", "errors");
+    g_errors << 1;
+    ```
+
+    Supports any type with a commutative, associative `operator+`, including `std::string` (concatenation) and `double`.
+  </Tab>
+  <Tab title="Maxer / Miner">
+    Track the maximum or minimum value seen.
+
+    ```c++
+    bvar::Maxer<int> max_latency;
+    max_latency << 10 << 50 << 30;
+    // max_latency.get_value() == 50
+
+    bvar::Miner<int> min_latency;
+    min_latency << 10 << 50 << 30;
+    // min_latency.get_value() == 10
+    ```
+
+    `Maxer` uses `std::numeric_limits<T>::min()` as identity; `Miner` uses `std::numeric_limits<T>::max()`.
+  </Tab>
+  <Tab title="LatencyRecorder">
+    Compound variable that automatically derives latency distribution, QPS, and count from raw latency samples.
+
+    ```c++
+    // Exposes four variables:
+    //   table2_my_table_write_latency
+    //   table2_my_table_write_max_latency
+    //   table2_my_table_write_qps
+    //   table2_my_table_write_count
+    bvar::LatencyRecorder g_write_latency("table2_my_table_write");
+
+    // In your write path:
+    g_write_latency << latency_us;
+    ```
+
+    Time window defaults to `bvar_dump_interval` (10 seconds).
+  </Tab>
+  <Tab title="Status">
+    Displays a single arbitrary value. Updated with `set_value()`.
+
+    ```c++
+    // Display a rarely or periodically updated value.
+    bvar::Status<int> g_worker_count("worker_count", 0);
+    g_worker_count.set_value(num_workers);
+
+    // String status.
+    bvar::Status<std::string> g_version("server_version", "1.0.0");
+    g_version.set_value("1.1.0");
+    ```
+
+    Use `PassiveStatus` when the value lives elsewhere and you want to read it on demand:
+
+    ```c++
+    static void get_username(std::ostream& os, void*) {
+        char buf[32];
+        if (getlogin_r(buf, sizeof(buf)) == 0) {
+            os << buf;
+        } else {
+            os << "unknown";
+        }
+    }
+    bvar::PassiveStatus<std::string> g_username("process_username",
+                                                 get_username, nullptr);
+    ```
+  </Tab>
+  <Tab title="Window / PerSecond">
+    Wrap an existing bvar to get values over a sliding time window.
+
+    ```c++
+    bvar::Adder<int> g_read_error;
+
+    // Sum of g_read_error over the last 60 seconds.
+    bvar::Window<bvar::Adder<int>> g_read_error_minute(
+        "foo_bar", "read_error_minute", &g_read_error, 60);
+
+    // Rate: increments per second averaged over 60 seconds.
+    bvar::PerSecond<bvar::Adder<int>> g_read_error_second(
+        "foo_bar", "read_error_second", &g_read_error, 60);
+    ```
+
+    `Window` returns the raw sum over the window. `PerSecond` divides by the window duration.
+
+    <Warning>
+    Do not use `PerSecond` with `Maxer` — dividing a maximum value by time is meaningless. Use `Window<Maxer<int>>` with a 1-second window instead.
+    </Warning>
+
+    Window and PerSecond auto-update from the underlying bvar — never push values to them directly.
+  </Tab>
+</Tabs>
+
+## Full example
+
+```c++
+#include <bvar/bvar.h>
+
+namespace foo {
+namespace bar {
+
+// Running sum — track read errors.
+bvar::Adder<int> g_read_error;
+
+// Sliding window — errors over the last minute.
+bvar::Window<bvar::Adder<int>> g_read_error_minute(
+    "foo_bar", "read_error", &g_read_error, 60);
+
+// Latency distribution for writes.
+bvar::LatencyRecorder g_write_latency("foo_bar", "write");
+
+// Tasks pushed — raw counter.
+bvar::Adder<int> g_task_pushed("foo_bar", "task_pushed");
+
+// Rate wrapper — tasks pushed per second over last 10 s (default window).
+bvar::PerSecond<bvar::Adder<int>> g_task_pushed_second(
+    "foo_bar", "task_pushed_second", &g_task_pushed);
+
+}  // namespace bar
+}  // namespace foo
+
+// In your request-handling code:
+void handle_request() {
+    // Record a read error.
+    foo::bar::g_read_error << 1;
+
+    // Record write latency of 23 ms.
+    foo::bar::g_write_latency << 23;
+
+    // A task was pushed.
+    foo::bar::g_task_pushed << 1;
+}
+```
+
+## Exposing bvars
+
+A bvar without a name is a fast private counter. To make it visible in `/vars`, expose it:
+
+```c++
+bvar::Adder<int> count1;
+count1 << 10 << 20 << 30;       // value is 60
+
+count1.expose("count1");         // now visible at /vars/count1
+// bvar::Variable::describe_exposed("count1") returns "60"
+
+// Or expose with a prefix (recommended for uniqueness):
+count1.expose_as("my_module", "error_count");
+// Visible at /vars/my_module_error_count
+```
+
+Names are normalized: `foo::BarNum`, `foo.bar.num`, and `foo-bar-num` all become `foo_bar_num`.
+
+**Naming convention:** `<module>_<class>_<indicator>`
+
+```
+iobuf_block_count       # module=iobuf   class=block    indicator=count
+process_memory_resident # module=process class=memory   indicator=resident
+rpc_socket_count        # module=rpc     class=socket   indicator=count
+```
+
+<Warning>
+bvar names must be globally unique. If a duplicate name is exposed, `expose()` prints a FATAL log and returns -1. With `-bvar_abort_on_same_name=true`, the process aborts.
+</Warning>
+
+## Exporting bvars to files
+
+Enable the dump feature to write all exposed bvars to a file periodically:
+
+```c++
+#include <gflags/gflags.h>
+
+int main(int argc, char* argv[]) {
+    // Enable dump on startup.
+    if (google::SetCommandLineOption("bvar_dump", "true").empty()) {
+        LOG(FATAL) << "Failed to enable bvar dump";
+    }
+    // ...
+}
+```
+
+Or start with `-bvar_dump` on the command line. The output file is written to `monitor/bvar.<appname>.data` by default:
+
+```bash
+$ tail -5 monitor/bvar.echo_server.data
+process_time_real : 2580.157680
+process_time_system : 0.380942
+process_time_user : 0.741887
+process_username : "gejun"
+rpc_server_8002_uptime_ms : 14740954
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `bvar_dump` | `false` | Enable background dump thread |
+| `bvar_dump_file` | `monitor/bvar.<app>.data` | Output file path |
+| `bvar_dump_interval` | `10` | Seconds between dumps |
+| `bvar_dump_include` | `""` | Wildcard allowlist (empty = all) |
+| `bvar_dump_exclude` | `""` | Wildcard denylist (empty = none) |
+| `bvar_dump_prefix` | `<app>` | Prefix prepended to all dumped names |
+
+<Note>
+Do not set `FLAGS_bvar_dump_file` or similar flags directly — they are `std::string` and not thread-safe to override. Always use `google::SetCommandLineOption()`.
+</Note>
+
+## Exporting to Prometheus
+
+Set the scrape target path to `/brpc_metrics`:
+
+```
+127.0.0.1:8080/brpc_metrics
+```
+
+## Thread safety
+
+- **Write operations** (`<< N`, `set_value`) are thread-safe by design.
+- **`expose()` and `hide()`** must not be called concurrently on the same bvar from different threads. In practice, expose once at construction.
+- `Window<>` and `PerSecond<>` must be initialized after the underlying bvar they wrap. Do not define them across translation units — global initialization order is undefined.

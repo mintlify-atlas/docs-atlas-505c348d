@@ -1,0 +1,172 @@
+---
+title: IOBuf
+description: Non-contiguous zero-copy buffer used throughout brpc for network I/O, protocol parsing, and RPC attachments — avoids memory copies when building or forwarding large payloads.
+---
+
+`butil::IOBuf` is a non-contiguous, reference-counted buffer that lets you cut, combine, and forward data without copying the underlying payload. It is the primary data structure for HTTP bodies, streaming attachments, and protocol frames inside brpc.
+
+The default block size is 8 KiB. Copying an `IOBuf` copies only the small metadata structure (block references and reference counts), not the payload bytes.
+
+## What IOBuf can do
+
+- **Default constructor** allocates no memory.
+- **Copy** shares the underlying blocks (reference-counted). Modifying the copy does not affect the original.
+- **Append another IOBuf** with no payload copy.
+- **Append a `std::string` or raw bytes** by copying the payload into a new block.
+- **Cut (consume)** bytes from the front.
+- **Read from / write to file descriptors** directly.
+- **Serialize to / parse from** protobuf messages via zero-copy streams.
+- **Build** printable content with `IOBufBuilder`, which works like `std::ostream`.
+
+<Note>
+IOBuf is thread-compatible but **not** thread-safe. Using different IOBuf instances from different threads simultaneously is safe. Modifying the same IOBuf from multiple threads concurrently is not.
+</Note>
+
+## Why zero-copy matters
+
+In a high-throughput RPC server, request and response payloads may be many kilobytes. Copying a 64 KiB payload at every layer (receive → parse → forward) wastes CPU and memory bandwidth. IOBuf's reference-counted block model means that forwarding a request body downstream takes O(1) time regardless of payload size.
+
+## Appending data
+
+```c++
+butil::IOBuf buf;
+
+// Append another IOBuf — no payload copy.
+butil::IOBuf another;
+another.append("hello");
+buf.append(another);  // zero-copy
+
+// Append a std::string — copies payload into a new block.
+std::string s = " world";
+buf.append(s);
+
+// Append raw bytes.
+const char* raw = "!";
+buf.append(raw, 1);
+```
+
+## Cutting (consuming) data
+
+Cutting removes bytes from the **front** of an IOBuf:
+
+```c++
+butil::IOBuf source;
+source.append("Hello, brpc!");
+
+butil::IOBuf dest;
+
+// Move the first 7 bytes from source into dest (no payload copy).
+source.cut(&dest, 7);
+// dest contains "Hello, "
+// source contains "brpc!"
+
+// Just discard bytes from the front.
+source.pop_front(5);
+// source is now empty
+```
+
+<Note>
+If you request more bytes than available, `cut()` moves all remaining bytes. `pop_front()` empties the buffer.
+</Note>
+
+## Serializing and parsing protobuf
+
+IOBuf integrates with protobuf's zero-copy stream interface:
+
+```c++
+// Serialize a protobuf message into an IOBuf.
+butil::IOBuf iobuf;
+butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
+pb_message.SerializeToZeroCopyStream(&wrapper);
+
+// Parse a protobuf message from an IOBuf.
+butil::IOBufAsZeroCopyInputStream in_wrapper(&iobuf);
+pb_message.ParseFromZeroCopyStream(&in_wrapper);
+```
+
+For custom binary formats, use `CodedInputStream`:
+
+```c++
+butil::IOBufAsZeroCopyInputStream wrapper(&iobuf);
+google::protobuf::io::CodedInputStream coded_stream(&wrapper);
+uint32_t value;
+coded_stream.ReadLittleEndian32(&value);
+```
+
+## Building IOBuf with ostream syntax
+
+`IOBufBuilder` implements `std::ostream`, making it easy to construct text payloads:
+
+```c++
+butil::IOBufBuilder os;
+os << "HTTP/1.1 200 OK\r\n"
+   << "Content-Type: text/plain\r\n"
+   << "\r\n"
+   << "Hello, world!";
+
+butil::IOBuf response = os.buf();
+```
+
+## Printing and converting to string
+
+```c++
+// Print directly to an ostream (only for printable content).
+std::cout << iobuf << std::endl;
+
+// Convert to std::string (allocates memory).
+std::string str = iobuf.to_string();
+printf("%s\n", str.c_str());
+```
+
+## Common patterns
+
+### Building an RPC request
+
+```c++
+butil::IOBuf request_body;
+butil::IOBufAsZeroCopyOutputStream wrapper(&request_body);
+my_proto_request.SerializeToZeroCopyStream(&wrapper);
+
+// Attach to controller for send.
+cntl.request_attachment().swap(request_body);
+```
+
+### Forwarding a response without copying
+
+```c++
+void ForwardResponse(const butil::IOBuf& upstream_body,
+                     butil::IOBuf* downstream_body) {
+    // No payload copy — just share block references.
+    downstream_body->append(upstream_body);
+}
+```
+
+### Reading a length-prefixed frame
+
+```c++
+// Assume buf contains: [4-byte little-endian length][payload...]
+uint32_t payload_len = 0;
+butil::IOBuf header;
+buf.cut(&header, sizeof(payload_len));
+
+butil::IOBufAsZeroCopyInputStream wrapper(&header);
+google::protobuf::io::CodedInputStream coded(&wrapper);
+coded.ReadLittleEndian32(&payload_len);
+
+butil::IOBuf payload;
+buf.cut(&payload, payload_len);
+```
+
+## IOBuf vs std::string performance
+
+| Operation | Throughput | QPS |
+|---|---|---|
+| Read → cut 12+16 B → copy → merge → write | 240 MB/s | 8,586,535 |
+| Read → cut 12+128 B → copy → merge → write | 790 MB/s | 5,643,014 |
+| Read → cut 12+1024 B → copy → merge → write | 1,520 MB/s | 1,467,171 |
+
+Throughput scales with block size because larger cuts amortize the per-operation overhead over more bytes.
+
+<Warning>
+Do not use IOBuf as a general-purpose string throughout your program. Its reference-counted 8 KiB blocks hold onto memory until all references are dropped. Keep IOBuf lifetimes short — create them to build a request or response, then send and discard.
+</Warning>

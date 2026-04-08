@@ -1,0 +1,314 @@
+---
+title: "Builtin services"
+description: "HTTP endpoints built into every bRPC server for monitoring, profiling, and debugging: /status, /vars, /connections, /flags, /rpcz, and profilers."
+---
+
+Every bRPC server exposes a set of HTTP endpoints that provide real-time visibility into its internals. These endpoints are accessible from a web browser or `curl` and adapt their output format automatically—HTML when accessed from a browser, plain text from a terminal. Append `?console=1` to any URL to force plain text.
+
+<Warning>
+  Builtin services expose internal server details (service names, latency
+  histograms, CPU profiles, file system paths, thread lists). **Never expose
+  them to public traffic.** Configure `ServerOptions.internal_port` or set
+  `has_builtin_services = false` before deploying to production. See [security
+  mode](#security-mode) below.
+</Warning>
+
+## Available builtin services
+
+<CardGroup cols={2}>
+  <Card title="/status" icon="chart-bar">
+    Real-time QPS, latency percentiles, error counts, and concurrency per
+    service method. The primary dashboard for a running server.
+  </Card>
+  <Card title="/vars" icon="database">
+    All exposed bvar metrics—counters, gauges, latency histograms—with
+    wildcard search and historical trend charts.
+  </Card>
+  <Card title="/connections" icon="network-wired">
+    Every active inbound and outbound connection with socket details, SSL
+    status, and byte counts.
+  </Card>
+  <Card title="/flags" icon="sliders">
+    All gflags with their current values. Certain flags can be modified at
+    runtime without restarting the server.
+  </Card>
+  <Card title="/rpcz" icon="magnifying-glass">
+    Traces of recent RPCs with timing breakdowns—useful for diagnosing
+    latency spikes and protocol issues.
+  </Card>
+  <Card title="/health" icon="heart-pulse">
+    Returns `OK` by default. Customizable via `ServerOptions.health_reporter`
+    for richer liveness/readiness semantics.
+  </Card>
+  <Card title="/version" icon="tag">
+    Returns the string set via `Server::set_version()`, or an auto-generated
+    name listing registered service names.
+  </Card>
+  <Card title="/protobufs" icon="file-code">
+    Schema browser for all protobuf message types registered in the server.
+  </Card>
+</CardGroup>
+
+---
+
+## /status — service dashboard
+
+`/status` shows a per-method summary sourced from the same bvar data as `/vars`, but organized by service.
+
+**Fields displayed for each method:**
+
+| Field | Meaning |
+|-------|---------|
+| `count` | Requests successfully processed (total) |
+| `error` | Requests that failed |
+| `latency` | Average latency over 60s / 60m / 24h / 30d |
+| `latency_percentiles` | 80th, 90th, 99th, 99.9th percentiles over the last 10 s |
+| `latency_cdf` | CDF chart of latency distribution (HTML only) |
+| `max_latency` | Maximum latency over 60s / 60m / 24h / 30d |
+| `qps` | Queries per second over 60s / 60m / 24h / 30d |
+| `processing` | Requests currently being processed (live concurrency) |
+| `non_service_error` | Errors raised outside service processing (e.g., parse failures) |
+| `connection_count` | Inbound connections from clients |
+
+<Note>
+  If `processing` never reaches zero after traffic drops to zero, the server
+  has a bug—either `done->Run()` is never called or a thread is permanently
+  blocked in a request handler.
+</Note>
+
+### Customizing /status output
+
+Implement `brpc::Describable` on your service to append custom status information:
+
+```c++
+class MyService : public XXXService, public brpc::Describable {
+public:
+    void Describe(std::ostream& os,
+                  const brpc::DescribeOptions& options) const override {
+        os << "queue_depth: " << _queue.size()
+           << "\ncache_hit_rate: " << _cache.hit_rate();
+    }
+};
+```
+
+---
+
+## /vars — metrics explorer
+
+`/vars` lists all exposed bvar metrics. bvar is bRPC's multi-threaded counter library; it stores data in thread-local storage to eliminate cache bouncing.
+
+### Query methods
+
+```bash
+# List all metrics
+curl http://localhost:8765/vars
+
+# Get a specific metric by name
+curl http://localhost:8765/vars/rpc_socket_count
+
+# Get several metrics at once
+curl http://localhost:8765/vars/pid,process_cpu_usage,rpc_controller_count
+
+# Wildcard search ($ matches a single character, not ?)
+curl http://localhost:8765/vars/bthread*
+curl http://localhost:8765/vars/rpc_server*_count
+```
+
+Example output:
+
+```bash
+$ curl http://localhost:8765/vars/bthread*
+bthread_creation_count : 125134
+bthread_creation_latency : 3
+bthread_creation_latency_50 : 3
+bthread_creation_latency_90 : 5
+bthread_creation_latency_99 : 7
+bthread_num_workers : 24
+bthread_worker_usage : 1.01056
+```
+
+### Adding custom metrics
+
+Use `bvar::LatencyRecorder` to track latency distributions of any code path. brpc exposes them automatically on `/vars`.
+
+```c++
+#include <bvar/bvar.h>
+
+bvar::LatencyRecorder g_db_latency("db_query");
+
+void query_db() {
+    int64_t start_us = butil::cpuwide_time_us();
+    // ... perform query ...
+    g_db_latency << (butil::cpuwide_time_us() - start_us);
+}
+```
+
+The metrics `db_query_latency`, `db_query_latency_cdf`, `db_query_qps`, etc., are then visible at `/vars/db_query*`.
+
+---
+
+## /flags — runtime gflags
+
+`/flags` lists all gflags registered in the process along with their current values and descriptions.
+
+Some flags support live modification without restarting the server. These are marked with a pencil icon in the web UI or can be changed via HTTP:
+
+```bash
+# View the current value of a flag
+curl http://localhost:8765/flags/log_idle_connection_close
+
+# Modify a flag at runtime (if the flag supports it)
+curl http://localhost:8765/flags/log_idle_connection_close?setvalue=true
+```
+
+Commonly toggled flags:
+
+| Flag | Effect |
+|------|--------|
+| `log_idle_connection_close` | Log a message before closing idle connections |
+| `log_connection_close` | Log when remote side closes a connection |
+| `http_verbose` | Print all HTTP request/response contents (debug only) |
+| `log_error_text` | Log all errors including client-caused ones |
+| `minloglevel` | Minimum log level: 0=INFO 1=NOTICE 2=WARNING 3=ERROR 4=FATAL |
+
+---
+
+## /connections — active connections
+
+`/connections` lists every socket the server currently holds open, including:
+
+- Remote address and port
+- Protocol detected on the connection
+- SSL status
+- Bytes sent and received
+- Time since last activity
+
+---
+
+## /rpcz — RPC tracing
+
+`/rpcz` shows a trace of recent RPCs handled by the server. Each entry includes timing breakdowns of the RPC pipeline stages—useful for diagnosing where latency is spent.
+
+---
+
+## Profilers
+
+The profilers require that the server is linked with gperftools (tcmalloc/libprofiler) and the corresponding sampling is enabled at startup or via flags.
+
+<AccordionGroup>
+  <Accordion title="CPU profiler">
+    Analyzes which functions consume the most CPU.
+
+    **Enable:**
+    ```bash
+    # Link with -lprofiler and start with profiling enabled, or access:
+    curl http://localhost:8765/pprof/profile?seconds=10 > profile.pb.gz
+    pprof --pdf ./my_server profile.pb.gz > profile.pdf
+    ```
+
+    The web UI at `/pprof/profile` triggers a 30-second (default) sampling run and returns a pprof-compatible profile.
+
+    <Note>
+      The CPU profiler does not work in subprocesses that called `fork` without
+      subsequently calling `exec`.
+    </Note>
+  </Accordion>
+  <Accordion title="Heap profiler">
+    Shows live memory allocations and where they were allocated.
+
+    ```bash
+    curl http://localhost:8765/pprof/heap > heap.pb.gz
+    pprof --pdf ./my_server heap.pb.gz > heap.pdf
+    ```
+
+    Requires tcmalloc (link with `-ltcmalloc`).
+  </Accordion>
+  <Accordion title="Contention profiler">
+    Identifies mutex hot spots and lock contention.
+
+    ```bash
+    curl http://localhost:8765/pprof/contention?seconds=10 > contention.pb.gz
+    pprof --pdf ./my_server contention.pb.gz > contention.pdf
+    ```
+
+    Samples lock wait times across all threads to find the most contended mutexes.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Other endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/health` | Returns `"OK"` (or custom content via `ServerOptions.health_reporter`) |
+| `/version` | Server version string set via `Server::set_version()` |
+| `/protobufs` | Schema of all registered protobuf messages |
+| `/vlog` | Lists all VLOG modules and their enabled state |
+| `/dir` | File browser — **disabled by default** (too dangerous to expose) |
+| `/threads` | Thread dump — **disabled by default** (significant performance impact) |
+
+---
+
+## Security mode
+
+<Warning>
+  Any server that can receive public requests—directly or through an HTTP
+  proxy like nginx—must hide its builtin services. An attacker with access to
+  `/flags`, `/vars`, or the profilers can extract sensitive operational data or
+  manipulate server behavior.
+</Warning>
+
+### Option 1: Internal port
+
+Serve builtin services on a port that is only reachable from your internal network:
+
+```c++
+brpc::ServerOptions options;
+options.internal_port = 8081; // accessible only internally
+
+server.Start(8080, &options); // public port sees no builtin services
+```
+
+Requests for builtin services on the public port (8080) return:
+
+```
+Not allowed to access builtin services, try ServerOptions.internal_port=...
+instead if you're inside internal network
+```
+
+### Option 2: Disable completely
+
+```c++
+brpc::ServerOptions options;
+options.has_builtin_services = false;
+```
+
+<Note>
+  Setting `has_builtin_services = false` also makes `internal_port`
+  ineffective. Prefer `internal_port` so you retain the ability to monitor
+  from the internal network.
+</Note>
+
+### Option 3: nginx allowlist
+
+Configure nginx to forward only specific API paths to your bRPC server:
+
+```nginx
+location /api/ {
+    proxy_pass http://<backend-server>/ServiceName/MethodName$query_string;
+}
+# /status, /vars, /flags etc. are blocked by nginx—never forwarded
+```
+
+### Verify a server is safe
+
+```bash
+curl -s -m 1 <HOST>:<PORT>/flags/enable_dir_service,enable_threads_service \
+  | awk '{if($3=="false"){++falsecnt}else if($3=="Value"){isrpc=1}} \
+         END{if(isrpc!=1||falsecnt==2){print "SAFE"}else{print "NOT SAFE"}}'
+```
+
+### Do not run as root
+
+bRPC writes various runtime files (PID file, rpcz dumps, profiling output). Running as root allows an attacker who can influence these writes to create or overwrite arbitrary files.

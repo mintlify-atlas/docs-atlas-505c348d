@@ -1,0 +1,267 @@
+---
+title: "Profiling"
+description: "Use bRPC's built-in CPU, heap, and contention profilers to find hotspots, memory growth, and lock bottlenecks in running services."
+---
+
+bRPC exposes three profilers through HTTP endpoints. Each profiler can be accessed through the built-in `/hotspots` web UI or queried directly with the `pprof` CLI tool.
+
+<Warning>
+Profiling adds sampling overhead to a live service. CPU and heap profiling require linking against tcmalloc. Run profilers during off-peak periods or on a canary instance when measuring production traffic patterns.
+</Warning>
+
+<Tabs>
+  <Tab title="CPU profiler">
+    The CPU profiler samples the call stack of active threads at a fixed frequency (default 100 Hz) using `SIGPROF`. After the sampling window closes, bRPC aggregates the samples into a call graph keyed by function symbol.
+
+    ### Prerequisites
+
+    <Steps>
+      <Step title="Link tcmalloc and the profiler">
+        Add `libtcmalloc_and_profiler.a` to your link step. Linking only the profiler without tcmalloc can cause crashes due to boundary-crossing heap operations.
+
+        ```bash
+        # CMake example
+        target_link_libraries(my_server tcmalloc_and_profiler)
+        ```
+
+        If tcmalloc uses frame pointers instead of libunwind for stack unwinding, add `-fno-omit-frame-pointer` to `CXXFLAGS` or `CFLAGS`. Without it, inter-function call edges are lost and the output graph shows isolated boxes.
+      </Step>
+      <Step title="Define BRPC_ENABLE_CPU_PROFILER">
+        Add `-DBRPC_ENABLE_CPU_PROFILER` to the compile flags of every translation unit that includes `brpc/channel.h` or `brpc/server.h`. The macro must be visible at the include site, not just in a downstream build target.
+
+        ```bash
+        # CMake example
+        target_compile_definitions(my_server PRIVATE BRPC_ENABLE_CPU_PROFILER)
+        ```
+      </Step>
+      <Step title="Disable server-side authentication (if needed)">
+        The `pprof` tool fetches `/pprof/symbol` to resolve addresses. If your server requires authentication, the fetch fails with:
+
+        ```
+        http://localhost:9002/profile/symbol doesn't exist
+        ```
+
+        Disable authentication for the profiling session or run on a non-authenticated endpoint.
+      </Step>
+    </Steps>
+
+    ### Using the CPU profiler
+
+    <Steps>
+      <Step title="Start the server">
+        Launch your server normally. No special flags are needed at startup.
+      </Step>
+      <Step title="Trigger a profile via the built-in UI">
+        Navigate to `http://HOST:PORT/hotspots/cpu` in a browser. Click the **profile** button to start a 10-second sampling window. Adjust the duration with `?seconds=N`.
+      </Step>
+      <Step title="Trigger a profile via pprof CLI">
+        ```bash
+        # Text output — sorted by self samples
+        tools/pprof --text 0.0.0.0:9002 --seconds=5
+
+        # Interactive mode
+        tools/pprof 0.0.0.0:9002 --seconds=5
+        ```
+
+        Example text output:
+
+        ```
+        Total: 2946 samples
+            1161  39.4%  39.4%     1161  39.4% syscall
+             248   8.4%  47.8%      248   8.4% bthread::TaskControl::steal_task
+             227   7.7%  55.5%      227   7.7% writev
+              87   3.0%  58.5%       88   3.0% ::cpp_alloc
+              74   2.5%  61.0%       74   2.5% __read_nocancel
+              46   1.6%  62.6%       48   1.6% tc_delete
+              42   1.4%  64.0%       42   1.4% brpc::Socket::Address
+        ```
+
+        Each row shows: self samples, self %, cumulative %, total samples (self + callees), total %, function name.
+      </Step>
+      <Step title="Generate a flame graph (optional)">
+        Install [FlameGraph](https://github.com/brendangregg/FlameGraph) and set the environment variable before starting the server:
+
+        ```bash
+        export FLAMEGRAPH_PL_PATH=/path/to/flamegraph.pl
+        ```
+
+        The `/hotspots/cpu` UI will then offer a flame graph view in addition to the call graph.
+      </Step>
+    </Steps>
+
+    ### Controlling sampling
+
+    | Mechanism | How |
+    |---|---|
+    | Sampling frequency | `export CPUPROFILE_FREQUENCY=200` before starting the server (default: 100) |
+    | Profile duration | Append `?seconds=N` to the URL, e.g. `/hotspots/cpu?seconds=30` |
+
+    ### macOS extra setup
+
+    The Perl `pprof` script in gperftools cannot resolve symbols on macOS. Install the standalone Go-based pprof and llvm-symbolizer:
+
+    ```bash
+    # Install standalone pprof and record its path
+    export GOOGLE_PPROF_BINARY_PATH=/path/to/pprof
+
+    # Install llvm-symbolizer
+    brew install llvm
+    ```
+  </Tab>
+
+  <Tab title="Heap profiler">
+    The heap profiler samples the call stack each time a cumulative allocation threshold is crossed (default 512 KB). It shows which functions are responsible for live heap at the time of sampling.
+
+    ### Prerequisites
+
+    <Steps>
+      <Step title="Link tcmalloc">
+        Link `libtcmalloc_and_profiler.a` (same as the CPU profiler). Add `-fno-omit-frame-pointer` if using frame-pointer-based stack unwinding.
+      </Step>
+      <Step title="Set TCMALLOC_SAMPLE_PARAMETER">
+        The heap profiler is inactive until this variable is set:
+
+        ```bash
+        export TCMALLOC_SAMPLE_PARAMETER=524288   # sample every 512 KB allocated
+        ```
+
+        Or pass it inline at process start:
+
+        ```bash
+        TCMALLOC_SAMPLE_PARAMETER=524288 ./my_server
+        ```
+
+        Without this variable, fetching `/pprof/heap` returns an empty profile with a misleading `header size >= 2**16` message.
+      </Step>
+    </Steps>
+
+    ### Using the heap profiler
+
+    <Steps>
+      <Step title="Fetch the heap profile via pprof CLI">
+        ```bash
+        tools/pprof --text localhost:9002/pprof/heap
+        ```
+
+        Example output (38.9 MB total):
+
+        ```
+        Total: 38.9 MB
+            35.8  92.0%  92.0%     35.8  92.0% ::cpp_alloc
+             2.1   5.4%  97.4%      2.1   5.4% butil::FlatMap
+             0.5   1.3%  98.7%      0.5   1.3% butil::IOBuf::append
+             0.5   1.3% 100.0%      0.5   1.3% butil::IOBufAsZeroCopyOutputStream::Next
+        ```
+      </Step>
+      <Step title="View in the built-in UI">
+        Navigate to `http://HOST:PORT/hotspots/heap`. Use the **View** dropdown to compare snapshots or the **Diff** dropdown to see allocations added since a previous snapshot. The last 32 profiles are retained (adjustable with `--max_profiles_kept`).
+      </Step>
+      <Step title="Analyze allocation growth with the growth profiler">
+        The growth profiler tracks cumulative allocations without subtracting frees, making it useful for finding allocation hotspots even when objects are short-lived. Access it at `/hotspots/growth`.
+      </Step>
+    </Steps>
+
+    ### Jemalloc heap profiler
+
+    bRPC also supports jemalloc as a heap profiler backend:
+
+    <Steps>
+      <Step title="Build jemalloc with profiling">
+        ```bash
+        ./configure --enable-prof
+        make && make install
+        ```
+      </Step>
+      <Step title="Run with profiling enabled">
+        ```bash
+        MALLOC_CONF="prof:true" LD_PRELOAD=/path/to/libjemalloc.so ./my_server
+        ```
+      </Step>
+      <Step title="Query the heap profile">
+        ```bash
+        jeprof ip:port/pprof/heap
+
+        # Text via curl
+        curl ip:port/pprof/heap?display=text
+
+        # SVG call graph
+        curl ip:port/pprof/heap?display=svg
+
+        # Flame graph (requires FLAMEGRAPH_PL_PATH)
+        curl ip:port/pprof/heap?display=flamegraph
+        ```
+      </Step>
+    </Steps>
+
+    Relevant jemalloc gflags at runtime:
+
+    | Flag | Description |
+    |---|---|
+    | `FLAGS_je_prof_active` | Enable (`true`) or disable (`false`) sampling |
+    | `FLAGS_je_prof_dump` | Changing this value writes a heap file for offline analysis |
+    | `FLAGS_je_prof_reset` | Clears accumulated samples and resets the sampling rate |
+
+    ### macOS extra setup
+
+    Same as the CPU profiler: set `GOOGLE_PPROF_BINARY_PATH` and install `llvm-symbolizer` via `brew install llvm`.
+  </Tab>
+
+  <Tab title="Contention profiler">
+    The contention profiler measures time threads spend waiting for mutexes, complementing the CPU profiler (which only captures time spent running). A mutex held for a long time will not appear prominently in the CPU profile but will dominate the contention profile.
+
+    > CPU profiler: busy time. Contention profiler: waiting time. They are complementary, not overlapping.
+
+    ### Prerequisites
+
+    No additional libraries required. The contention profiler does not depend on tcmalloc, libunwind, or frame pointers. It works out of the box on any bRPC server.
+
+    ### Supported mutex types
+
+    - `pthread_mutex_t` (non-recursive)
+    - `bthread_mutex_t`
+
+    ### Using the contention profiler
+
+    <Steps>
+      <Step title="Start a contention profile">
+        Navigate to `http://HOST:PORT/hotspots/contention` in a browser and click **contention**. The default sampling window is 10 seconds.
+
+        Or fetch directly:
+
+        ```bash
+        tools/pprof --text localhost:9002/pprof/contention --seconds=10
+        ```
+      </Step>
+      <Step title="Read the results">
+        The top-level number is **Total seconds** — the sum of all wait time across all threads during the window. Follow the arrows to see which call sites are responsible.
+
+        Switch to the **count** view to see how many times each lock was contended (an estimation). Comparing time and count on the same profile reveals whether a lock is contended rarely but held long, or contended constantly for short periods.
+      </Step>
+    </Steps>
+
+    ### Sampling rate
+
+    The profiler collects at most 1000 contention events per second by default. When the actual contention rate `N` exceeds 1000, each lock is sampled with probability `1000/N`. This rate is shared with `rpc_dump` and controlled by:
+
+    | Flag | Default | Description |
+    |---|---|---|
+    | `bvar_collector_expected_per_second` | 1000 | Target samples per second across all collectors |
+
+    In practice, services running at 100,000–600,000 QPS show no measurable throughput impact from the contention profiler.
+
+    <Note>
+    Contention profiler time is wall-clock wait time, not CPU time. A thread sleeping in `pthread_mutex_lock` consumes zero CPU but accumulates contention time. This is why high-contention locks may be invisible in the CPU profile.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Comparing the three profilers
+
+| | CPU profiler | Heap profiler | Contention profiler |
+|---|---|---|---|
+| What it measures | CPU time per function | Live heap by call site | Mutex wait time |
+| Requires tcmalloc | Yes | Yes | No |
+| Compile-time flag | `BRPC_ENABLE_CPU_PROFILER` | — | — |
+| Environment variable | `CPUPROFILE_FREQUENCY` | `TCMALLOC_SAMPLE_PARAMETER` | — |
+| Endpoint | `/pprof/profile` | `/pprof/heap` | `/pprof/contention` |
+| Built-in UI | `/hotspots/cpu` | `/hotspots/heap` | `/hotspots/contention` |

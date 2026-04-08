@@ -1,0 +1,439 @@
+---
+title: "Redis & Memcache Clients"
+description: "Access Redis and Memcache servers using bRPC's native protocol support. Covers RedisRequest, RedisResponse, pipeline commands, MemcacheRequest, and thread-safety guarantees."
+---
+
+# Redis & Memcache Clients
+
+bRPC provides native support for Redis and Memcache protocols on top of the same `brpc::Channel` infrastructure — giving you thread safety, connection reuse, async access, and all other bRPC benefits.
+
+<Tabs>
+  <Tab title="Redis">
+    ## Redis Client
+
+    bRPC supports the Redis protocol (compatible with Redis 1.2+, the same wire format as hiredis). All processes share a **single connection** to each Redis server by default, with requests from multiple bthreads merged in a wait-free manner for significantly higher throughput than hiredis.
+
+    ### Advantages Over hiredis
+
+    - **Thread safety**: share one channel across all threads — no per-thread client setup.
+    - **Single connection, batched writes**: requests from many bthreads are merged before sending, so Redis sees large batches and reaches much higher QPS.
+    - **Full bRPC integration**: supports synchronous, asynchronous, semi-synchronous calls; timeouts, backup requests, cancellation, tracing, built-in services.
+
+    ### Creating a Redis Channel
+
+    ```c++
+    #include <brpc/redis.h>
+    #include <brpc/channel.h>
+
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_REDIS;
+
+    brpc::Channel redis_channel;
+    if (redis_channel.Init("0.0.0.0:6379", &options) != 0) {
+        // 6379 is the default Redis port
+        LOG(ERROR) << "Fail to init channel to redis-server";
+        return -1;
+    }
+    ```
+
+    ### Single Commands
+
+    Use `brpc::RedisRequest` and `brpc::RedisResponse`. Commands are added with `AddCommand` (printf-style formatting):
+
+    ```c++
+    std::string my_key = "my_key_1";
+    int my_number = 1;
+
+    // Execute "SET my_key_1 1"
+    brpc::RedisRequest set_request;
+    brpc::RedisResponse response;
+    brpc::Controller cntl;
+
+    set_request.AddCommand("SET %s %d", my_key.c_str(), my_number);
+    redis_channel.CallMethod(NULL, &cntl, &set_request, &response, NULL);
+
+    if (cntl.Failed()) {
+        LOG(ERROR) << "Fail to access redis-server";
+        return -1;
+    }
+    if (response.reply(0).is_error()) {
+        LOG(ERROR) << "SET failed: " << response.reply(0).error_message();
+        return -1;
+    }
+    LOG(INFO) << response.reply(0).c_str(); // "OK"
+    ```
+
+    ```c++
+    // Execute "INCR my_key_1"
+    brpc::RedisRequest incr_request;
+    incr_request.AddCommand("INCR %s", my_key.c_str());
+    response.Clear();
+    cntl.Reset();
+
+    redis_channel.CallMethod(NULL, &cntl, &incr_request, &response, NULL);
+    if (!cntl.Failed() && !response.reply(0).is_error()) {
+        LOG(INFO) << response.reply(0).integer(); // 2
+    }
+    ```
+
+    ### Pipelined (Batched) Commands
+
+    Multiple commands in a single `RedisRequest` are sent together in one network round trip:
+
+    ```c++
+    brpc::RedisRequest request;
+    brpc::RedisResponse response;
+    brpc::Controller cntl;
+
+    request.AddCommand("INCR counter1");
+    request.AddCommand("DECR counter1");
+    request.AddCommand("INCRBY counter1 10");
+    request.AddCommand("DECRBY counter1 20");
+
+    redis_channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    if (cntl.Failed()) {
+        LOG(ERROR) << "Fail to access redis-server";
+        return -1;
+    }
+
+    // response.reply_size() == request.command_size() == 4
+    CHECK_EQ(4, response.reply_size());
+    for (int i = 0; i < 4; ++i) {
+        CHECK(response.reply(i).is_integer());
+    }
+    // counter started at 1: INCR→1, DECR→0, INCRBY→10, DECRBY→-10
+    CHECK_EQ(1,   response.reply(0).integer());
+    CHECK_EQ(0,   response.reply(1).integer());
+    CHECK_EQ(10,  response.reply(2).integer());
+    CHECK_EQ(-10, response.reply(3).integer());
+    ```
+
+    ### Authentication
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_REDIS;
+    brpc::policy::RedisAuthenticator* auth =
+        new brpc::policy::RedisAuthenticator("my_password");
+    options.auth = auth;
+    // auth is owned by ChannelOptions / Channel internals.
+    ```
+
+    ### RedisRequest API
+
+    ```c++
+    // printf-style formatting (%b for binary data: pointer + length)
+    bool AddCommand(const char* fmt, ...);
+    bool AddCommandV(const char* fmt, va_list args);
+
+    // Explicit array of components — immune to escaping issues.
+    bool AddCommandByComponents(const butil::StringPiece* components, size_t n);
+
+    // Check how many commands were added successfully.
+    int command_size() const;
+
+    // Reset before reuse.
+    void Clear();
+    ```
+
+    <Warning>
+    Never use user-controlled input as the `fmt` argument to `AddCommand` or `AddCommandV` — this can cause crashes or data leaks. Use `AddCommandByComponents` for untrusted input.
+    </Warning>
+
+    ### RedisResponse Reply Types
+
+    Each reply in `RedisResponse` is a `RedisReply` and has one of these types:
+
+    | Type | Test Method | Value Method |
+    |------|------------|--------------|
+    | `REDIS_REPLY_NIL` | `is_nil()` | — |
+    | `REDIS_REPLY_STATUS` | `is_string()` | `c_str()` / `data()` |
+    | `REDIS_REPLY_STRING` | `is_string()` | `c_str()` / `data()` |
+    | `REDIS_REPLY_ERROR` | `is_error()` | `error_message()` |
+    | `REDIS_REPLY_INTEGER` | `is_integer()` | `integer()` |
+    | `REDIS_REPLY_ARRAY` | `is_array()` | `size()` / `operator[]` |
+
+    ```c++
+    // Example: response with integer, string, and array replies
+    int64_t num  = response.reply(0).integer();
+    const char* str = response.reply(1).c_str();
+    size_t arr_size = response.reply(2).size();
+    const brpc::RedisReply& first_elem = response.reply(2)[0];
+    ```
+
+    All replies are owned by `RedisResponse` and freed when it is destroyed.
+
+    ### Redis Cluster
+
+    For a native Redis Cluster (slot-based routing, MOVED/ASK redirection):
+
+    ```c++
+    #include <brpc/redis_cluster.h>
+
+    brpc::RedisClusterChannel channel;
+    brpc::RedisClusterChannelOptions options;
+    options.max_redirect = 5;
+
+    if (channel.Init("127.0.0.1:7000,127.0.0.1:7001", &options) != 0) {
+        LOG(ERROR) << "Fail to init redis cluster channel";
+        return -1;
+    }
+    ```
+
+    `RedisClusterChannel` supports automatic MOVED/ASK redirection, periodic topology refresh, and multi-key commands (`MGET`, `MSET`, `DEL`, `EXISTS`, `UNLINK`, `EVAL`, `EVALSHA`).
+
+    For a twemproxy-based cluster (proxy handles routing), use a regular `Channel` with consistent hashing:
+
+    ```c++
+    // Each request must target the same key (single command or all same key).
+    options.protocol = brpc::PROTOCOL_REDIS;
+    channel.Init("bns://redis-cluster", "c_md5", &options);
+    cntl.set_request_code(brpc::policy::MurmurHash32(key.data(), key.size()));
+    ```
+
+    ### Performance
+
+    bRPC's single-connection approach merges writes from multiple bthreads in a wait-free manner, letting Redis process requests in large batches:
+
+    | Threads | QPS (single conn) | QPS (pooled conn / hiredis peak) |
+    |---------|-------------------|----------------------------------|
+    | 1 | ~18,000 | ~18,000 |
+    | 50 | ~300,000 | ~75,000 |
+    | 200 | ~412,000 | — (redis-server CPU saturated) |
+
+    The pooled-connection case saturates the Redis server CPU at ~75K QPS because each connection can only carry one request at a time. The single-connection case batches many requests per network round trip.
+
+    ### Debugging
+
+    ```bash
+    # Print every Redis request and response (development only):
+    --redis_verbose=true
+    # Replace \r\n with spaces in debug logs for readability:
+    --redis_verbose_crlf2space=true
+    ```
+  </Tab>
+
+  <Tab title="Memcache">
+    ## Memcache Client
+
+    bRPC supports the **binary protocol** of Memcache (memcached 1.3+). It provides thread safety, connection reuse, and pipeline mode out of the box.
+
+    <Note>
+    bRPC only supports the binary Memcache protocol. If your memcached is older than 1.3, upgrade it. There is no benefit to supporting the legacy textual protocol.
+    </Note>
+
+    ### Advantages Over libmemcached
+
+    - **Thread safety**: one channel shared by all threads.
+    - **Request/response model**: responses are matched to requests automatically; no manual bookkeeping.
+    - **bRPC integration**: async, timeout, backup requests, tracing, built-in dashboards.
+    - **Performance**: a single client can saturate a local memcached at ~90K QPS (single connection) or ~330K QPS (multiple connections).
+
+    ### Creating a Memcache Channel
+
+    ```c++
+    #include <brpc/memcache.h>
+    #include <brpc/channel.h>
+
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_MEMCACHE;
+
+    brpc::Channel channel;
+    if (channel.Init("0.0.0.0:11211", &options) != 0) {
+        // 11211 is the default Memcache port
+        LOG(FATAL) << "Fail to init channel to memcached";
+        return -1;
+    }
+    ```
+
+    ### SET
+
+    ```c++
+    brpc::MemcacheRequest request;
+    brpc::MemcacheResponse response;
+    brpc::Controller cntl;
+
+    // Set key="hello", value="world", flags=0xdeadbeef, expire in 10 seconds, no CAS
+    if (!request.Set("hello", "world", 0xdeadbeef /*flags*/,
+                     10 /*exptime seconds*/, 0 /*ignore CAS*/)) {
+        LOG(FATAL) << "Fail to build SET request";
+        return -1;
+    }
+
+    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+
+    if (cntl.Failed()) {
+        LOG(FATAL) << "RPC failed: " << cntl.ErrorText();
+        return -1;
+    }
+    if (!response.PopSet(NULL /*cas_value*/)) {
+        LOG(FATAL) << "SET failed: " << response.LastError();
+        return -1;
+    }
+    ```
+
+    ### GET
+
+    ```c++
+    brpc::MemcacheRequest get_request;
+    brpc::MemcacheResponse get_response;
+    brpc::Controller get_cntl;
+
+    get_request.Get("hello");
+    channel.CallMethod(NULL, &get_cntl, &get_request, &get_response, NULL);
+
+    if (get_cntl.Failed()) {
+        LOG(ERROR) << "RPC failed: " << get_cntl.ErrorText();
+        return -1;
+    }
+
+    std::string value;
+    uint32_t flags;
+    uint64_t cas_value;
+    if (!get_response.PopGet(&value, &flags, &cas_value)) {
+        LOG(ERROR) << "GET failed: " << get_response.LastError();
+        return -1;
+    }
+    LOG(INFO) << "Got: " << value << " (flags=" << flags << ")";
+    ```
+
+    ### DELETE
+
+    ```c++
+    brpc::MemcacheRequest del_request;
+    brpc::MemcacheResponse del_response;
+    brpc::Controller del_cntl;
+
+    del_request.Delete("hello");
+    channel.CallMethod(NULL, &del_cntl, &del_request, &del_response, NULL);
+
+    if (del_cntl.Failed()) {
+        LOG(ERROR) << "RPC failed: " << del_cntl.ErrorText();
+        return -1;
+    }
+    if (!del_response.PopDelete()) {
+        LOG(ERROR) << "DELETE failed: " << del_response.LastError();
+    }
+    ```
+
+    ### Pipeline Mode (Multiple Operations per Request)
+
+    Multiple operations in one `MemcacheRequest` are sent together:
+
+    ```c++
+    brpc::MemcacheRequest request;
+    brpc::MemcacheResponse response;
+    brpc::Controller cntl;
+
+    request.Set("key1", "value1", 0, 60, 0);
+    request.Set("key2", "value2", 0, 60, 0);
+    request.Get("key1");
+
+    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+
+    if (!cntl.Failed()) {
+        uint64_t cas;
+        response.PopSet(&cas);          // result of first Set
+        response.PopSet(&cas);          // result of second Set
+        std::string val;
+        uint32_t flags;
+        response.PopGet(&val, &flags, &cas); // result of Get
+    }
+    ```
+
+    <Warning>
+    For cluster access with consistent hashing, each `MemcacheRequest` must contain only **one operation** or all operations must share the **same key**. Multiple operations with different keys will always be sent to the same server (based on the first key), which is wrong for sharded clusters.
+    </Warning>
+
+    ### Supported Operations
+
+    **Requests:**
+
+    ```c++
+    bool Set(const Slice& key, const Slice& value,
+             uint32_t flags, uint32_t exptime, uint64_t cas_value);
+    bool Add(const Slice& key, const Slice& value,
+             uint32_t flags, uint32_t exptime, uint64_t cas_value);
+    bool Replace(const Slice& key, const Slice& value,
+                 uint32_t flags, uint32_t exptime, uint64_t cas_value);
+    bool Append(const Slice& key, const Slice& value,
+                uint32_t flags, uint32_t exptime, uint64_t cas_value);
+    bool Prepend(const Slice& key, const Slice& value,
+                 uint32_t flags, uint32_t exptime, uint64_t cas_value);
+    bool Delete(const Slice& key);
+    bool Flush(uint32_t timeout);
+    bool Increment(const Slice& key, uint64_t delta,
+                   uint64_t initial_value, uint32_t exptime);
+    bool Decrement(const Slice& key, uint64_t delta,
+                   uint64_t initial_value, uint32_t exptime);
+    bool Touch(const Slice& key, uint32_t exptime);
+    bool Version();
+    ```
+
+    **Corresponding response pop methods:**
+
+    ```c++
+    bool PopGet(IOBuf* value, uint32_t* flags, uint64_t* cas_value);
+    bool PopGet(std::string* value, uint32_t* flags, uint64_t* cas_value);
+    bool PopSet(uint64_t* cas_value);
+    bool PopAdd(uint64_t* cas_value);
+    bool PopReplace(uint64_t* cas_value);
+    bool PopAppend(uint64_t* cas_value);
+    bool PopPrepend(uint64_t* cas_value);
+    bool PopDelete();
+    bool PopFlush();
+    bool PopIncrement(uint64_t* new_value, uint64_t* cas_value);
+    bool PopDecrement(uint64_t* new_value, uint64_t* cas_value);
+    bool PopTouch();
+    bool PopVersion(std::string* version);
+    ```
+
+    Each `Pop*` call must match the corresponding operation in the request, in order. Mismatches are rejected with an error message.
+
+    ### Error Handling
+
+    Pop operations return `false` on failure. Use `response.LastError()` to get the error message:
+
+    ```c++
+    if (!response.PopSet(NULL)) {
+        LOG(ERROR) << "Operation failed: " << response.LastError();
+    }
+    ```
+
+    Note that a `PopXXX` failure is **independent of the RPC result**. The RPC can succeed (connection and protocol are fine) while the operation itself fails (e.g., key not found, CAS mismatch). Always check both `cntl.Failed()` and `response.PopXXX()`.
+
+    ### Cluster Access
+
+    For consistent sharding across a Memcache cluster:
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_MEMCACHE;
+
+    brpc::Channel channel;
+    channel.Init("bns://my-memcache-cluster", "c_md5", &options);
+
+    // Set request_code to route to the right shard.
+    brpc::Controller cntl;
+    cntl.set_request_code(brpc::policy::MurmurHash32(key.data(), key.size()));
+    ```
+
+    Alternatively, use a twemproxy in front of the cluster and connect to it as a single server.
+  </Tab>
+</Tabs>
+
+---
+
+## Comparison Summary
+
+| Feature | Redis | Memcache |
+|---------|-------|---------|
+| Protocol | Redis RESP (1.2+) | Binary (memcached 1.3+) |
+| bRPC protocol name | `PROTOCOL_REDIS` | `PROTOCOL_MEMCACHE` |
+| Default connection type | Single | Single |
+| Default port | 6379 | 11211 |
+| Pipeline | `AddCommand` multiple times | Multiple `request.XXX()` calls |
+| Response access | `response.reply(i)` | `response.PopXXX()` in order |
+| Thread safety | Yes — share one channel | Yes — share one channel |
+| Cluster support | `RedisClusterChannel` or c_md5 | c_md5 + single-key requests |
+| Authentication | `RedisAuthenticator` | — |

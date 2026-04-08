@@ -1,0 +1,84 @@
+{
+  "projectType": "framework",
+  "projectName": "bRPC",
+  "projectDescription": "An industrial-grade C++ RPC framework supporting multiple protocols on the same port, designed for high-performance distributed systems at massive scale.",
+  "theme": "aspen",
+  "primaryColor": "#5cbbfc",
+  "lightColor": "#9a9a9a",
+  "darkColor": "#7c7c7c",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "getting-started",
+              "quickstart-server",
+              "quickstart-client"
+            ]
+          },
+          {
+            "group": "Server",
+            "pages": [
+              "server/basics",
+              "server/http-service",
+              "server/streaming-rpc",
+              "server/builtin-services"
+            ]
+          },
+          {
+            "group": "Client",
+            "pages": [
+              "client/basics",
+              "client/channels-naming",
+              "client/combo-channels",
+              "client/http-client",
+              "client/redis-memcache"
+            ]
+          },
+          {
+            "group": "Core Components",
+            "pages": [
+              "core/bthread",
+              "core/bvar",
+              "core/iobuf",
+              "core/load-balancing"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/new-protocol",
+              "advanced/performance",
+              "advanced/profiling",
+              "advanced/rdma"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-protocol support on a single port (HTTP/H2, gRPC, Redis, Memcached, Thrift, and Baidu internal protocols)",
+    "High-performance M:N threading via bthread (user-space threads) for minimal latency",
+    "Flexible client patterns: synchronous, asynchronous, semi-synchronous, and combo channels",
+    "Built-in observability via HTTP-accessible services for profiling, tracing (rpcz), and metrics (bvar/vars)",
+    "Extensible architecture: custom naming services, load balancers, and protocols",
+    "Industrial-grade reliability used at Baidu with 1,000,000+ server instances"
+  ],
+  "publicApiSurface": [
+    "brpc::Server — server lifecycle and service registration",
+    "brpc::Channel — client-side RPC channel to a server or cluster",
+    "brpc::Controller — per-RPC parameters, metadata, and error handling",
+    "brpc::ClosureGuard — RAII helper to ensure done->Run() is called",
+    "brpc::StreamId / brpc::Stream — streaming RPC primitives",
+    "brpc::ParallelChannel — fan-out requests to multiple sub-channels in parallel",
+    "brpc::SelectiveChannel — select one sub-channel per RPC for HA/sharding",
+    "bvar::Adder / bvar::LatencyRecorder / bvar::Status — metrics collection",
+    "bthread_t / bthread_start_background — user-space threading API",
+    "brpc::IOBuf — zero-copy buffer for network I/O"
+  ]
+}

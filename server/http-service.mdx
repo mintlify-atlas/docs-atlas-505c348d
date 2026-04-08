@@ -1,0 +1,367 @@
+---
+title: "HTTP service"
+description: "Serve HTTP/1.1, HTTP/2, and gRPC on the same port as protobuf services, with automatic JSON ↔ protobuf conversion."
+---
+
+bRPC servers detect the protocol of each incoming connection automatically. HTTP/1.1, HTTP/2, gRPC (h2/gRPC), and protobuf services all share a single listening port with no configuration required.
+
+## Protobuf services over HTTP
+
+Any protobuf service can be called via HTTP by sending a JSON-encoded body. The JSON is automatically converted to the protobuf request message and back.
+
+```bash
+# The echo service defined in echo.proto is immediately accessible via HTTP
+curl -d '{"message":"hello"}' http://localhost:8765/EchoService/Echo
+# {"message":"hello"}
+
+# Use protobuf wire format for better performance
+curl -d '{"message":"hello"}' \
+     -H 'Content-Type: application/proto' \
+     http://localhost:8765/EchoService/Echo
+```
+
+**JSON ↔ protobuf conversion rules:**
+
+- JSON field names are matched to protobuf field names by exact name
+- The JSON body must contain all `required` fields; missing required fields cause the request to be rejected
+- Extra JSON fields not present in the proto schema are silently dropped (not stored as unknown fields)
+- To represent enum values as numbers instead of names, start the server with `-pb_enum_as_number`
+
+## Dedicated HTTP services
+
+For pure HTTP workloads (no protobuf schema on request/response), declare methods with empty messages in the proto file. All data flows through the `Controller`.
+
+<Steps>
+  <Step title="Declare the service in .proto">
+    ```protobuf
+    option cc_generic_services = true;
+
+    message HttpRequest  { }
+    message HttpResponse { }
+
+    service HttpService {
+        rpc Echo(HttpRequest) returns (HttpResponse);
+    }
+    ```
+  </Step>
+
+  <Step title="Implement the service">
+    All HTTP data is accessed through `brpc::Controller`:
+
+    - Request headers: `cntl->http_request()`
+    - Request body: `cntl->request_attachment()`
+    - Response headers: `cntl->http_response()`
+    - Response body: `cntl->response_attachment()`
+
+    ```c++
+    class HttpServiceImpl : public HttpService {
+    public:
+        virtual void Echo(google::protobuf::RpcController* cntl_base,
+                          const HttpRequest* /*request*/,
+                          HttpResponse* /*response*/,
+                          google::protobuf::Closure* done) {
+            brpc::ClosureGuard done_guard(done);
+            brpc::Controller* cntl =
+                static_cast<brpc::Controller*>(cntl_base);
+
+            cntl->http_response().set_content_type("text/plain");
+
+            butil::IOBufBuilder os;
+            os << "queries:";
+            for (brpc::URI::QueryIterator it =
+                     cntl->http_request().uri().QueryBegin();
+                 it != cntl->http_request().uri().QueryEnd(); ++it) {
+                os << ' ' << it->first << '=' << it->second;
+            }
+            os << "\nbody: " << cntl->request_attachment() << '\n';
+            os.move_to(cntl->response_attachment());
+        }
+    };
+    ```
+  </Step>
+
+  <Step title="Register the service">
+    ```c++
+    HttpServiceImpl http_svc;
+    server.AddService(&http_svc, brpc::SERVER_DOESNT_OWN_SERVICE);
+    ```
+
+    The service is now accessible at `/HttpService/Echo`. Any path suffix after the method name is available as `cntl->http_request().unresolved_path()`.
+
+    | URL | `uri().path()` | `unresolved_path()` |
+    |-----|---------------|---------------------|
+    | `/HttpService/Echo` | `/HttpService/Echo` | `""` |
+    | `/HttpService/Echo/Foo` | `/HttpService/Echo/Foo` | `"Foo"` |
+    | `/HttpService/Echo/Foo/Bar` | `/HttpService/Echo/Foo/Bar` | `"Foo/Bar"` |
+  </Step>
+</Steps>
+
+## Reading and writing HTTP parameters
+
+### HTTP headers
+
+```c++
+// Read a request header (case-insensitive)
+const std::string* user_agent =
+    cntl->http_request().GetHeader("User-Agent");
+if (user_agent != NULL) {
+    LOG(INFO) << "User-Agent: " << *user_agent;
+}
+
+// Write a response header
+cntl->http_response().SetHeader("Accept-Encoding", "gzip");
+
+// Append to an existing response header
+cntl->http_response().AppendHeader("Accept-Encoding", "deflate");
+```
+
+### Content-Type
+
+`Content-Type` is handled specially in brpc:
+
+```c++
+// Read Content-Type
+if (cntl->http_request().content_type() == "application/json") {
+    // ...
+}
+
+// Set Content-Type on the response
+cntl->http_response().set_content_type("application/json");
+```
+
+<Note>
+  `cntl->GetHeader("Content-Type")` returns nothing. Always use
+  `content_type()` / `set_content_type()` for the Content-Type header.
+</Note>
+
+### Status codes
+
+```c++
+// Set a status code
+cntl->http_response().set_status_code(brpc::HTTP_STATUS_NOT_FOUND);
+
+// Set a status code with a custom reason phrase
+cntl->http_response().set_status_code(
+    brpc::HTTP_STATUS_INTERNAL_SERVER_ERROR,
+    "Database unavailable");
+
+// Check a status code
+if (cntl->http_response().status_code() == brpc::HTTP_STATUS_NOT_FOUND) {
+    LOG(ERROR) << cntl->http_response().reason_phrase();
+}
+```
+
+Example: HTTP 302 redirect
+
+```c++
+cntl->http_response().set_status_code(brpc::HTTP_STATUS_FOUND);
+cntl->http_response().SetHeader("Location", "https://example.com/new-path");
+```
+
+### Query strings
+
+```c++
+// Read a query parameter (?time=2015-01-02)
+const std::string* time_value =
+    cntl->http_request().uri().GetQuery("time");
+if (time_value != NULL) {
+    LOG(INFO) << "time=" << *time_value;
+}
+
+// Set a query parameter
+cntl->http_request().uri().SetQuery("time", "2015/1/2");
+```
+
+## Restful URL mapping
+
+By default a method is accessible at `/ServiceName/MethodName`. Pass a `restful_mappings` string to `AddService` to use custom paths.
+
+```protobuf
+service QueueService {
+    rpc start(HttpRequest)         returns (HttpResponse);
+    rpc stop(HttpRequest)          returns (HttpResponse);
+    rpc get_stats(HttpRequest)     returns (HttpResponse);
+    rpc download_data(HttpRequest) returns (HttpResponse);
+}
+```
+
+```c++
+if (server.AddService(&queue_svc,
+                      brpc::SERVER_DOESNT_OWN_SERVICE,
+                      "/v1/queue/start    => start,"
+                      "/v1/queue/stop     => stop,"
+                      "/v1/queue/stats/*  => get_stats") != 0) {
+    LOG(ERROR) << "Fail to add queue_svc";
+    return -1;
+}
+```
+
+Wildcard rules:
+
+- `*` matches any string segment
+- `/v1/queue/stats/*` — the matched suffix is in `cntl->http_request().unresolved_path()`
+- Multiple paths can map to the same method
+- Mapped methods are **no longer** accessible at `/ServiceName/MethodName`
+- Un-mapped methods keep their default `/ServiceName/MethodName` path
+- At most one `*` per path
+
+## Serving a resource tree with `default_method`
+
+For file-server style APIs where the URL suffix is the resource path, name the proto method `default_method`:
+
+```protobuf
+service FileService {
+    rpc default_method(HttpRequest) returns (HttpResponse);
+}
+```
+
+```c++
+class FileServiceImpl : public FileService {
+public:
+    virtual void default_method(google::protobuf::RpcController* cntl_base,
+                                const HttpRequest* /*request*/,
+                                HttpResponse* /*response*/,
+                                google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl =
+            static_cast<brpc::Controller*>(cntl_base);
+        cntl->response_attachment().append("Getting file: ");
+        cntl->response_attachment().append(
+            cntl->http_request().unresolved_path());
+    }
+};
+```
+
+| URL | `unresolved_path()` |
+|-----|---------------------|
+| `/FileService` | `""` |
+| `/FileService/123.txt` | `"123.txt"` |
+| `/FileService/mydir/123.txt` | `"mydir/123.txt"` |
+
+## gRPC and HTTP/2
+
+<Tabs>
+  <Tab title="gRPC (h2:grpc)">
+    brpc servers are compatible with gRPC clients out of the box. No code changes are needed on the server side—gRPC clients can call protobuf services directly.
+
+    On the client side, set `ChannelOptions.protocol` to `"h2:grpc"`:
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = "h2:grpc";
+    ```
+
+    The default gRPC wire format is protobuf. `"h2:grpc"` and `"h2:grpc+proto"` are equivalent.
+  </Tab>
+  <Tab title="gRPC + JSON (h2:grpc+json)">
+    To use JSON instead of protobuf with gRPC framing (useful for interoperability with certain gRPC-gateway setups):
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = "h2:grpc+json";
+    ```
+
+    <Note>
+      Standard gRPC implementations do not support JSON encoding natively. The
+      peer must register a JSON codec explicitly (for example, grpc-go users
+      can register a custom codec).
+    </Note>
+  </Tab>
+  <Tab title="HTTP/2 + protobuf (h2:proto)">
+    HTTP/2 connections default to protobuf wire format. `"h2"` and `"h2:proto"` are equivalent.
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = "h2";  // same as "h2:proto"
+    ```
+  </Tab>
+</Tabs>
+
+## Compressing the response body
+
+```c++
+// Try to gzip-compress the response body
+// (only applied when client sends Accept-Encoding: gzip
+//  and body size >= http_body_compress_threshold, default 512 bytes)
+cntl->set_response_compress_type(brpc::COMPRESS_TYPE_GZIP);
+```
+
+## Decompressing the request body
+
+brpc does not decompress request bodies automatically:
+
+```c++
+#include <brpc/policy/gzip_compress.h>
+
+const std::string* encoding =
+    cntl->http_request().GetHeader("Content-Encoding");
+if (encoding != NULL && *encoding == "gzip") {
+    butil::IOBuf uncompressed;
+    if (!brpc::policy::GzipDecompress(cntl->request_attachment(),
+                                       &uncompressed)) {
+        LOG(ERROR) << "Fail to un-gzip request body";
+        cntl->SetFailed("Decompression failed");
+        return;
+    }
+    cntl->request_attachment().swap(uncompressed);
+}
+// cntl->request_attachment() now contains decompressed data
+```
+
+## Progressive (streaming) HTTP responses
+
+For large or unbounded responses (e.g., Server-Sent Events), use `ProgressiveAttachment`:
+
+```c++
+#include <brpc/progressive_attachment.h>
+
+butil::intrusive_ptr<brpc::ProgressiveAttachment> pa =
+    cntl->CreateProgressiveAttachment();
+
+// Write can happen before or after done->Run()
+// Before done->Run(): data is buffered
+// After done->Run(): data is sent immediately in chunked mode
+pa->Write("data: hello\n\n");
+
+// Release pa when done to free resources
+```
+
+## Bypassing JSON ↔ protobuf conversion
+
+For services that parse the HTTP body themselves (e.g., legacy services migrated to brpc):
+
+```c++
+brpc::ServiceOptions svc_opt;
+svc_opt.allow_http_body_to_pb = false; // disable automatic conversion
+server.AddService(service, svc_opt);
+```
+
+When `allow_http_body_to_pb` is false, check `cntl->request_protocol()` to detect HTTP/H2 and parse the body manually:
+
+```c++
+if (cntl->request_protocol() == brpc::PROTOCOL_HTTP ||
+    cntl->request_protocol() == brpc::PROTOCOL_H2) {
+    // Parse cntl->request_attachment() yourself
+}
+```
+
+## Enabling SSL (HTTPS)
+
+```c++
+brpc::ServerSSLOptions* ssl = options.mutable_ssl_options();
+ssl->default_cert.certificate = "/path/to/cert.pem";
+ssl->default_cert.private_key = "/path/to/key.pem";
+
+// Optional: negotiate application-layer protocol
+ssl->alpns = "http, h2, baidu_std";
+```
+
+Non-SSL clients can still connect to the same port; brpc detects SSL automatically.
+
+## Debugging
+
+Enable `-http_verbose` to print all HTTP request and response contents to the log. Use only during development:
+
+```bash
+./my_server --http_verbose=true
+```

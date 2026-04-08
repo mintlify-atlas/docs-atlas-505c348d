@@ -1,0 +1,349 @@
+---
+title: "HTTP Client"
+description: "Use brpc::Channel to send HTTP/1.1, HTTP/2, and gRPC requests. Covers GET, POST, headers, progressive download, and protobuf-over-HTTP."
+---
+
+# HTTP Client
+
+bRPC uses `brpc::Channel` for HTTP/1.1 and HTTP/2 (H2) requests. Set `ChannelOptions.protocol` to the appropriate protocol and use `channel.CallMethod()` directly — no stub needed, since HTTP is not tied to protobuf.
+
+<Note>
+bRPC names all HTTP/2 connections "h2" internally, regardless of whether SSL is used. On the `/connections` built-in page, plaintext H2 appears as "h2c" and encrypted H2 as "h2".
+</Note>
+
+---
+
+## Creating an HTTP Channel
+
+```c++
+#include <brpc/channel.h>
+
+brpc::ChannelOptions options;
+options.protocol = brpc::PROTOCOL_HTTP;  // HTTP/1.1
+// options.protocol = brpc::PROTOCOL_H2; // HTTP/2
+
+brpc::Channel channel;
+if (channel.Init("www.example.com" /*any valid URL*/, &options) != 0) {
+    LOG(ERROR) << "Fail to initialize channel";
+    return -1;
+}
+```
+
+`Channel::Init()` only uses the **host and port** from the URL — the path and query string are discarded. You set the full URL (including path) on the controller before each call.
+
+HTTP channels also support naming services for clusters:
+
+```c++
+// All servers in a BNS group, accessed over HTTP
+channel.Init("bns://my-http-service", "rr", &options);
+```
+
+---
+
+## Making Requests
+
+<Tabs>
+  <Tab title="GET">
+    Set the URI on the controller and pass all-`NULL` except for `cntl` and `done`:
+
+    ```c++
+    brpc::Controller cntl;
+    cntl.http_request().uri() = "www.example.com/index.html";
+
+    channel.CallMethod(NULL, &cntl, NULL, NULL, NULL /*done = sync*/);
+
+    if (cntl.Failed()) {
+        LOG(ERROR) << "HTTP GET failed: " << cntl.ErrorText();
+        return;
+    }
+
+    // Response body is in response_attachment() as butil::IOBuf.
+    // Convert to std::string if you need contiguous memory (allocates + copies).
+    std::string body = cntl.response_attachment().to_string();
+    LOG(INFO) << "Status: " << cntl.http_response().status_code();
+    LOG(INFO) << "Body length: " << body.size();
+    ```
+  </Tab>
+
+  <Tab title="POST">
+    Set the HTTP method and write the body into `request_attachment()`:
+
+    ```c++
+    brpc::Controller cntl;
+    cntl.http_request().uri() = "www.example.com/api/create";
+    cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
+    cntl.http_request().set_content_type("application/json");
+    cntl.request_attachment().append("{\"name\":\"brpc\",\"version\":1}");
+
+    channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+
+    if (cntl.Failed()) {
+        LOG(ERROR) << "HTTP POST failed: " << cntl.ErrorText();
+    }
+    ```
+
+    For complex bodies with many printed fields, use `butil::IOBufBuilder`:
+
+    ```c++
+    butil::IOBufBuilder os;
+    os << "A lot of printing" << some_object << another_field;
+    os.move_to(cntl.request_attachment());
+    ```
+  </Tab>
+
+  <Tab title="Custom Headers & Queries">
+    Read and write headers and query parameters via the `http_request()` accessor:
+
+    ```c++
+    brpc::Controller cntl;
+
+    // Set headers
+    cntl.http_request().SetHeader("Authorization", "Bearer my-token");
+    cntl.http_request().SetHeader("Accept", "application/json");
+
+    // Set query parameters
+    cntl.http_request().uri() = "www.example.com/search";
+    cntl.http_request().uri().SetQuery("q", "brpc");
+    cntl.http_request().uri().SetQuery("page", "1");
+
+    channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+
+    // Read response headers
+    const std::string* content_type =
+        cntl.http_response().GetHeader("Content-Type");
+    if (content_type) {
+        LOG(INFO) << "Content-Type: " << *content_type;
+    }
+
+    // HTTP status code
+    int status = cntl.http_response().status_code();
+    LOG(INFO) << "HTTP status: " << status;
+    ```
+
+    <Note>
+    HTTP header field names are case-insensitive per RFC 2616. bRPC preserves the case you set but matches case-insensitively.
+    </Note>
+  </Tab>
+
+  <Tab title="HTTP/2 (H2)">
+    Switch to HTTP/2 by changing the protocol option:
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_H2;
+
+    brpc::Channel channel;
+    channel.Init("www.example.com", &options);
+
+    brpc::Controller cntl;
+    cntl.http_request().uri() = "www.example.com/api/data";
+    channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+    ```
+
+    H2 uses a **single multiplexed connection** by default (unlike HTTP/1.1 which uses pooled connections). The API is otherwise identical to HTTP/1.1.
+
+    To force HTTP/1.0 (no Keep-Alive) for legacy servers:
+
+    ```c++
+    cntl.http_request().set_version(1, 0);
+    ```
+
+    <Note>
+    Setting the HTTP version has no effect on H2 channels. H2 responses received by the client and H2 requests received by the server always show version (2, 0).
+    </Note>
+  </Tab>
+
+  <Tab title="gRPC">
+    Use the `h2:grpc` protocol string to talk to gRPC servers:
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.protocol = "h2:grpc";
+
+    brpc::Channel channel;
+    channel.Init("grpc-server.example.com:50051", &options);
+
+    // For gRPC, use a protobuf stub as you would with baidu_std:
+    MyService_Stub stub(&channel);
+    brpc::Controller cntl;
+    MyRequest request;
+    MyResponse response;
+
+    request.set_message("hello");
+    stub.MyMethod(&cntl, &request, &response, NULL);
+
+    if (cntl.Failed()) {
+        LOG(ERROR) << "gRPC call failed: " << cntl.ErrorText();
+    }
+    ```
+
+    `h2:grpc` is based on HTTP/2 and uses a single connection by default.
+  </Tab>
+</Tabs>
+
+---
+
+## URL Handling
+
+`Channel::Init()` and `cntl.http_request().uri()` are separate because they serve different purposes:
+
+- `Channel::Init()` sets the **destination** (host + port) — used for connection pooling and naming service lookups.
+- `cntl.http_request().uri()` sets the **request URI** — sent in the HTTP request line and `Host` header.
+
+This separation is necessary when:
+- Accessing a cluster via a naming service (Init takes the service name, uri takes the full URL).
+- Routing through an HTTP proxy (Init takes the proxy address, uri takes the target URL).
+
+### Host Header
+
+bRPC sets the `Host` header automatically:
+
+| Situation | Host header value |
+|-----------|------------------|
+| User sets `Host` header explicitly | User's value (unchanged) |
+| URL in `uri()` contains a hostname | Hostname from `uri()` |
+| No hostname in `uri()`, channel Init used a domain name | Domain from Init |
+| No hostname anywhere, channel Init used an IP | `ip:port` of target |
+
+In H2, the equivalent header is `:authority`.
+
+---
+
+## HTTP Errors
+
+When the server returns a non-2xx status code, `cntl.ErrorCode()` is set to `EHTTP`:
+
+```c++
+if (cntl.Failed()) {
+    if (cntl.ErrorCode() == brpc::EHTTP) {
+        int http_status = cntl.http_response().status_code();
+        LOG(ERROR) << "HTTP error " << http_status;
+        // Error body is in response_attachment()
+        LOG(ERROR) << cntl.response_attachment().to_string();
+    } else {
+        LOG(ERROR) << "RPC error: " << cntl.ErrorText();
+    }
+}
+```
+
+To get the real bRPC `ErrorCode` from a bRPC server over HTTP (instead of `EHTTP`), set the gflag `-use_http_error_code=true`.
+
+---
+
+## Compressing Request Bodies
+
+```c++
+// Request framework to gzip the body if it's larger than 512 bytes.
+// (Threshold controlled by -http_body_compress_threshold, default 512)
+cntl.set_request_compress_type(brpc::COMPRESS_TYPE_GZIP);
+```
+
+### Decompressing Response Bodies
+
+bRPC does **not** automatically decompress response bodies. Handle it yourself:
+
+```c++
+#include <brpc/policy/gzip_compress.h>
+
+const std::string* encoding =
+    cntl.http_response().GetHeader("Content-Encoding");
+if (encoding != NULL && *encoding == "gzip") {
+    butil::IOBuf uncompressed;
+    if (!brpc::policy::GzipDecompress(cntl.response_attachment(), &uncompressed)) {
+        LOG(ERROR) << "Fail to decompress response body";
+        return;
+    }
+    cntl.response_attachment().swap(uncompressed);
+}
+// cntl.response_attachment() now contains decompressed data.
+```
+
+---
+
+## Progressive Download
+
+By default bRPC buffers the entire HTTP body in memory before completing the RPC. For large or streaming responses, use progressive download to process data as it arrives:
+
+**Step 1**: Implement `ProgressiveReader`:
+
+```c++
+#include <brpc/progressive_reader.h>
+
+class MyProgressiveReader : public brpc::ProgressiveReader {
+public:
+    // Called each time a chunk of data arrives.
+    // Return a non-OK status to close the socket immediately (permanent error).
+    butil::Status OnReadOnePart(const void* data, size_t length) override {
+        // Process `length` bytes at `data` (e.g., write to file, parse chunk)
+        fwrite(data, 1, length, output_file_);
+        return butil::Status::OK();
+    }
+
+    // Called once when there is no more data or the connection breaks.
+    // status.ok() = message fully received; otherwise = connection error.
+    // You may delete `this` here.
+    void OnEndOfMessage(const butil::Status& status) override {
+        fclose(output_file_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Progressive read failed: " << status;
+        }
+        delete this;
+    }
+
+private:
+    FILE* output_file_;
+};
+```
+
+**Step 2**: Tell bRPC to complete the RPC after reading headers (not the full body):
+
+```c++
+brpc::Controller cntl;
+cntl.http_request().uri() = "www.example.com/large-file.mp4";
+cntl.response_will_be_read_progressively(); // complete RPC after headers
+
+channel.CallMethod(NULL, &cntl, NULL, NULL, NULL);
+```
+
+**Step 3**: Attach your reader after the RPC returns:
+
+```c++
+if (!cntl.Failed()) {
+    cntl.ReadProgressiveAttachmentBy(new MyProgressiveReader());
+}
+```
+
+<Note>
+Progressive download is about letting you handle arbitrarily large bodies — it is separate from HTTP chunked transfer encoding, which bRPC has always supported.
+</Note>
+
+---
+
+## HTTPS
+
+Enable SSL by using an `https://` URI (bRPC detects the prefix automatically) or by calling `options.mutable_ssl_options()`:
+
+```c++
+// Option 1: brpc detects https:// prefix and enables SSL automatically.
+cntl.http_request().uri() = "https://secure.example.com/api";
+
+// Option 2: explicit SSL options on the channel.
+brpc::ChannelOptions options;
+options.protocol = brpc::PROTOCOL_HTTP;
+options.mutable_ssl_options()->sni_name = "secure.example.com";
+options.mutable_ssl_options()->alpn_protocols = {"h2", "http/1.1"};
+channel.Init("secure.example.com:443", &options);
+```
+
+---
+
+## Debugging
+
+Enable verbose HTTP logging (for development only — never in production):
+
+```bash
+# As a gflag at startup:
+--http_verbose=true
+```
+
+This prints every request and response, including headers and body excerpts.

@@ -1,0 +1,304 @@
+---
+title: "Quickstart: client"
+description: "Create a Channel, build a service stub, and make synchronous and asynchronous RPC calls using the bRPC echo example."
+---
+
+This guide walks through building the canonical echo client included in `example/echo_c++/`. The full source is at [`example/echo_c++/client.cpp`](https://github.com/apache/brpc/blob/master/example/echo_c%2B%2B/client.cpp).
+
+<Note>
+  There is no `brpc::Client` class. The client-side abstraction is `brpc::Channel`, which represents a communication line to one server or a cluster of servers.
+</Note>
+
+<Steps>
+  <Step title="Create a Channel and initialize it">
+    A `Channel` is thread-safe and intended to be shared across all threads in your process. Create it once and reuse it; do not create a new Channel per request.
+
+    ```c++
+    #include <brpc/channel.h>
+    #include "echo.pb.h"
+
+    DEFINE_string(server, "0.0.0.0:8000", "IP address of server");
+    DEFINE_string(load_balancer, "", "The algorithm for load balancing");
+    DEFINE_string(protocol, "baidu_std", "Protocol type");
+    DEFINE_string(connection_type, "", "Connection type: single, pooled, short");
+    DEFINE_int32(timeout_ms, 100, "RPC timeout in milliseconds");
+    DEFINE_int32(max_retry, 3, "Max retries (not counting the first attempt)");
+
+    int main(int argc, char* argv[]) {
+        GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+
+        brpc::Channel channel;
+
+        brpc::ChannelOptions options;
+        options.protocol       = FLAGS_protocol;
+        options.connection_type = FLAGS_connection_type;
+        options.timeout_ms     = FLAGS_timeout_ms;
+        options.max_retry      = FLAGS_max_retry;
+
+        // Pass load_balancer="" for a single server, or "rr"/"random"/etc. for a cluster
+        if (channel.Init(FLAGS_server.c_str(), FLAGS_load_balancer.c_str(), &options) != 0) {
+            LOG(ERROR) << "Fail to initialize channel";
+            return -1;
+        }
+        // channel is ready to use
+    }
+    ```
+
+    ### Init overloads
+
+    ```c++
+    // Connect to a single server
+    int Init(const char* server_addr_and_port, const ChannelOptions* options);
+    int Init(EndPoint server_addr_and_port, const ChannelOptions* options);
+    int Init(const char* server_addr, int port, const ChannelOptions* options);
+
+    // Connect to a cluster via a naming service
+    int Init(const char* naming_service_url,
+             const char* load_balancer_name,
+             const ChannelOptions* options);
+    ```
+
+    For a single server, pass an empty string or `NULL` as `load_balancer_name`. Valid address formats include `"0.0.0.0:8000"`, `"localhost:9000"`, and `"www.example.com:8765"`.
+
+    For a cluster, pass a naming service URL such as `"bns://my-service"`, `"file:///conf/servers.list"`, or `"list://10.0.0.1:8000,10.0.0.2:8000"`, along with a load balancer name like `"rr"` (round-robin), `"random"`, or `"la"` (locality-aware).
+
+    <Warning>
+      `Channel::Init()` is **not** thread-safe. Initialize the Channel from a single thread before sharing it with others.
+    </Warning>
+
+    ### ChannelOptions reference
+
+    | Field | Default | Description |
+    |---|---|---|
+    | `protocol` | `"baidu_std"` | Wire protocol. Common values: `"baidu_std"`, `"http"`, `"h2"`, `"h2:grpc"`, `"redis"` |
+    | `connection_type` | `""` (protocol default) | `"single"`, `"pooled"`, or `"short"` |
+    | `timeout_ms` | 1000 | RPC deadline in milliseconds. `-1` means wait indefinitely. |
+    | `connect_timeout_ms` | (≤ timeout_ms) | Connection establishment timeout. Capped at `timeout_ms`. |
+    | `max_retry` | 3 | Maximum number of retries after the initial attempt. `0` disables retries. |
+    | `backup_request_ms` | -1 (disabled) | Send a backup request to a different server if no response arrives within this many ms |
+  </Step>
+
+  <Step title="Create a stub and a Controller">
+    A stub wraps a `Channel` and provides typed methods matching your proto service. Like `Channel`, stubs are thread-safe and can be shared.
+
+    A `Controller` carries per-RPC parameters and results. Unlike channels and stubs, a Controller corresponds to exactly one RPC and must not be shared between concurrent calls.
+
+    ```c++
+    // Stub wraps the channel and provides typed RPC methods.
+    // It is lightweight and safe to construct on the stack.
+    example::EchoService_Stub stub(&channel);
+
+    // Controller holds per-RPC state.
+    // For synchronous calls: put it on the stack.
+    // For asynchronous calls: allocate on the heap, delete in the callback.
+    brpc::Controller cntl;
+
+    // Optional: tag this RPC for log correlation across services.
+    cntl.set_log_id(42);
+
+    // Optional: override the channel-level timeout for this specific call.
+    cntl.set_timeout_ms(200);
+    ```
+  </Step>
+
+  <Step title="Make a synchronous call">
+    Pass `NULL` as the `done` parameter to block until the response arrives or an error occurs. The controller, request, and response can safely be placed on the stack.
+
+    ```c++
+    example::EchoRequest request;
+    example::EchoResponse response;
+    brpc::Controller cntl;
+
+    request.set_message("hello world");
+    cntl.set_log_id(1);
+
+    // Blocks until response or error (including timeout).
+    stub.Echo(&cntl, &request, &response, NULL);
+
+    if (!cntl.Failed()) {
+        LOG(INFO) << "Received response from " << cntl.remote_side()
+                  << ": " << response.message()
+                  << " latency=" << cntl.latency_us() << "us";
+    } else {
+        LOG(WARNING) << cntl.ErrorText();
+    }
+    ```
+
+    ### Error handling
+
+    | Method | Returns |
+    |---|---|
+    | `cntl.Failed()` | `true` if the RPC failed for any reason |
+    | `cntl.ErrorCode()` | Numeric error code (e.g., `brpc::ERPCTIMEDOUT` for timeouts) |
+    | `cntl.ErrorText()` | Human-readable error description |
+    | `cntl.latency_us()` | Round-trip latency in microseconds (valid only after a successful call) |
+    | `cntl.remote_side()` | `butil::EndPoint` of the server that handled the request |
+
+    <Warning>
+      Do not hold a pthread mutex while making a synchronous call. The blocked call can cause deadlock if another thread tries to acquire the same mutex inside the bRPC I/O path. Use `bthread_mutex_t` instead of `pthread_mutex_t`, or release the lock before calling.
+    </Warning>
+  </Step>
+
+  <Step title="Make an asynchronous call">
+    Pass a `google::protobuf::Closure*` as the `done` parameter. `CallMethod` returns immediately after sending the request. The closure is invoked by the framework—in a separate bthread—when the response arrives or an error occurs.
+
+    Because the framework may call `done->Run()` after `CallMethod` returns, the `response` and `cntl` objects **must** be allocated on the heap and deleted inside the callback.
+
+    ### Pattern: use brpc::NewCallback
+
+    ```c++
+    static void OnRPCDone(example::EchoResponse* response,
+                          brpc::Controller* cntl) {
+        // unique_ptr deletes response and cntl when this function returns.
+        std::unique_ptr<example::EchoResponse> response_guard(response);
+        std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+
+        if (cntl->Failed()) {
+            LOG(WARNING) << "RPC failed: " << cntl->ErrorText();
+        } else {
+            LOG(INFO) << "Response: " << response->message()
+                      << " latency=" << cntl->latency_us() << "us";
+        }
+        // Closure created by NewCallback deletes itself after Run() returns.
+    }
+
+    // Allocate response and cntl on the heap.
+    example::EchoResponse* response = new example::EchoResponse;
+    brpc::Controller* cntl          = new brpc::Controller;
+
+    example::EchoRequest request;  // request can stay on the stack
+    request.set_message("hello world");
+    cntl->set_log_id(1);
+
+    // Returns immediately. OnRPCDone is called when the RPC completes.
+    stub.Echo(cntl, &request, response,
+              brpc::NewCallback(OnRPCDone, response, cntl));
+    ```
+
+    <Note>
+      `brpc::NewCallback` is defined in `src/brpc/callback.h`. Use it instead of `google::protobuf::NewCallback`, which became private in protobuf 3.
+    </Note>
+
+    ### Pattern: inherit google::protobuf::Closure
+
+    If heap allocations in the callback are a profiled bottleneck, combine `response`, `cntl`, and the closure into one heap allocation:
+
+    ```c++
+    class OnRPCDone : public google::protobuf::Closure {
+    public:
+        void Run() override {
+            std::unique_ptr<OnRPCDone> self_guard(this);
+            if (cntl.Failed()) {
+                LOG(WARNING) << "RPC failed: " << cntl.ErrorText();
+            } else {
+                LOG(INFO) << "Response: " << response.message();
+            }
+        }
+
+        example::EchoResponse response;
+        brpc::Controller      cntl;
+    };
+
+    OnRPCDone* done = new OnRPCDone;
+    example::EchoRequest request;
+    request.set_message("hello world");
+
+    stub.Echo(&done->cntl, &request, &done->response, done);
+    ```
+
+    ### Waiting for multiple asynchronous RPCs
+
+    To fan out multiple RPCs and wait for all of them to finish (semi-synchronous pattern), save each call's ID **before** launching the RPC, then `Join` on those IDs:
+
+    ```c++
+    brpc::Controller cntl1, cntl2;
+    example::EchoResponse resp1, resp2;
+    example::EchoRequest req1, req2;
+
+    req1.set_message("request one");
+    req2.set_message("request two");
+
+    // Save call IDs before launching—controllers may be deleted in callbacks.
+    const brpc::CallId id1 = cntl1.call_id();
+    const brpc::CallId id2 = cntl2.call_id();
+
+    stub.Echo(&cntl1, &req1, &resp1, brpc::DoNothing());
+    stub.Echo(&cntl2, &req2, &resp2, brpc::DoNothing());
+
+    brpc::Join(id1);  // blocks until RPC 1 completes
+    brpc::Join(id2);  // blocks until RPC 2 completes
+
+    // Both RPCs are done; safe to read resp1, resp2, cntl1, cntl2.
+    ```
+
+    `brpc::DoNothing()` is a framework-managed closure that does nothing; its lifetime is managed by bRPC.
+
+    <Tip>
+      Consider `brpc::ParallelChannel` for more complex fan-out patterns where you want declarative sharding or parallel access to multiple backends.
+    </Tip>
+  </Step>
+</Steps>
+
+## Complete example: synchronous client loop
+
+The following is the full `main()` from `example/echo_c++/client.cpp`, which sends one request per second in a loop:
+
+```c++
+#include <gflags/gflags.h>
+#include <butil/logging.h>
+#include <butil/time.h>
+#include <brpc/channel.h>
+#include "echo.pb.h"
+
+DEFINE_string(server, "0.0.0.0:8000", "IP Address of server");
+DEFINE_string(protocol, "baidu_std", "Protocol type");
+DEFINE_string(connection_type, "", "Connection type: single, pooled, short");
+DEFINE_int32(timeout_ms, 100, "RPC timeout in milliseconds");
+DEFINE_int32(max_retry, 3, "Max retries (not including the first RPC)");
+DEFINE_int32(interval_ms, 1000, "Milliseconds between consecutive requests");
+
+int main(int argc, char* argv[]) {
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+
+    brpc::Channel channel;
+
+    brpc::ChannelOptions options;
+    options.protocol       = FLAGS_protocol;
+    options.connection_type = FLAGS_connection_type;
+    options.timeout_ms     = FLAGS_timeout_ms;
+    options.max_retry      = FLAGS_max_retry;
+
+    if (channel.Init(FLAGS_server.c_str(), "", &options) != 0) {
+        LOG(ERROR) << "Fail to initialize channel";
+        return -1;
+    }
+
+    example::EchoService_Stub stub(&channel);
+
+    int log_id = 0;
+    while (!brpc::IsAskedToQuit()) {
+        example::EchoRequest request;
+        example::EchoResponse response;
+        brpc::Controller cntl;
+
+        request.set_message("hello world");
+        cntl.set_log_id(log_id++);
+
+        stub.Echo(&cntl, &request, &response, NULL);
+
+        if (!cntl.Failed()) {
+            LOG(INFO) << "Received response from " << cntl.remote_side()
+                      << " to " << cntl.local_side()
+                      << ": " << response.message()
+                      << " latency=" << cntl.latency_us() << "us";
+        } else {
+            LOG(WARNING) << cntl.ErrorText();
+        }
+
+        usleep(FLAGS_interval_ms * 1000L);
+    }
+
+    LOG(INFO) << "EchoClient is going to quit";
+    return 0;
+}
+```

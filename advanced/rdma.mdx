@@ -1,0 +1,200 @@
+---
+title: "RDMA transport"
+description: "Enable Remote Direct Memory Access in bRPC to reduce latency by bypassing the kernel network stack on RDMA-capable clusters."
+---
+
+RDMA (Remote Direct Memory Access) allows network data to be transferred directly between application memory on two machines without involving the CPU or kernel on the data path. In high-performance clusters this eliminates kernel crossing overhead and reduces latency compared to TCP.
+
+bRPC wraps RDMA behind the familiar `Socket` abstraction. Switching from TCP to RDMA requires two flag changes and compatible hardware; the rest of the API is unchanged.
+
+<Warning>
+RDMA requires:
+- RDMA-capable network adapters (InfiniBand or RoCE)
+- `libibverbs` and `librdmacm` installed on the host
+- Linux operating system (RDMA build is not verified on other platforms)
+
+Without RDMA hardware, building with `WITH_RDMA=ON` will compile but connections will fail at runtime.
+</Warning>
+
+## Building with RDMA support
+
+<Steps>
+  <Step title="Build bRPC with the RDMA flag">
+    <Tabs>
+      <Tab title="CMake">
+        ```bash
+        mkdir bld && cd bld
+        cmake -DWITH_RDMA=ON ..
+        make
+        ```
+      </Tab>
+      <Tab title="config_brpc.sh">
+        ```bash
+        sh config_brpc.sh --with-rdma \
+            --headers="/usr/include" \
+            --libs="/usr/lib64 /usr/bin"
+        make
+        ```
+      </Tab>
+      <Tab title="Bazel">
+        ```bash
+        # Server
+        bazel build --define=BRPC_WITH_RDMA=true example:rdma_performance_server
+
+        # Client
+        bazel build --define=BRPC_WITH_RDMA=true example:rdma_performance_client
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+  <Step title="Build the RDMA performance example">
+    ```bash
+    cd example/rdma_performance
+    mkdir bld && cd bld
+    cmake ..
+    make
+    ```
+  </Step>
+  <Step title="Enable RDMA at runtime on the server">
+    Set `ServerOptions.use_rdma = true` before calling `server.Start()`:
+
+    ```c++
+    brpc::ServerOptions options;
+    options.use_rdma = true;
+    server.Start(port, &options);
+    ```
+  </Step>
+  <Step title="Enable RDMA at runtime on the client">
+    Set `ChannelOptions.use_rdma = true` before calling `channel.Init()`:
+
+    ```c++
+    brpc::ChannelOptions options;
+    options.use_rdma = true;
+    channel.Init("192.168.1.10:8000", &options);
+    ```
+  </Step>
+</Steps>
+
+## How bRPC implements RDMA
+
+bRPC uses **RDMA RC (Reliable Connected)** mode. Each `RdmaEndpoint` owns one Queue Pair (QP).
+
+### Connection setup
+
+Before RDMA data can flow, both sides must exchange metadata (GID, QPN). bRPC performs this handshake over the existing TCP connection using the `AppConnect` mechanism. After the handshake the TCP connection stays in `ESTABLISHED` state but carries no application data. If the TCP connection closes, the corresponding RDMA connection is immediately set to error.
+
+### Data transmission
+
+Three mechanisms work together to make RDMA transfers efficient:
+
+**Zero-copy** — All transmit data lives in `IOBuf` `Block` slices. Those blocks are posted directly to the RDMA QP via the verbs API; no intermediate copy is made. References to in-flight send blocks are held in `RdmaEndpoint::_sbuf` until the send CQE arrives. Receive buffers are pre-posted `IOBuf` blocks stored in `RdmaEndpoint::_rbuf`, each of fixed size `recv_block_size`.
+
+**Sliding window flow control** — The receive side sends explicit ACKs to prevent a fast sender from overwhelming a slow receiver (analogous to TCP's receive window). ACK numbers are piggybacked as immediate data on normal messages to reduce overhead.
+
+**Event suppression** — Every message is bounded by `recv_block_size` (default 8 KB). Generating a completion event for every small message would be slower than TCP due to the absence of GSO/GRO. `RdmaEndpoint` sets the solicited flag selectively based on message size, pending window, and pending ACKs, so completions are batched.
+
+### Memory registration
+
+RDMA requires all DMA memory to be registered with the HCA. Registration is expensive, so bRPC uses a pooled RDMA memory region (`src/brpc/rdma/block_pool.cpp`) that takes over allocation for `IOBuf` blocks. Register enough memory upfront using the pool size flags.
+
+For application-managed buffers, call:
+
+```c++
+// Register memory manually and obtain an lkey
+uint32_t lkey = rdma::RegisterMemoryForRdma(ptr, size);
+
+// Attach the buffer to an IOBuf with its lkey
+iobuf.append_user_data_with_meta(ptr, size, lkey);
+```
+
+See `src/brpc/rdma/rdma_helper.h` for the full API.
+
+## Runtime parameters
+
+All parameters are gflags and can be set on the command line or via `google::SetCommandLineOption`.
+
+### Memory pool
+
+| Flag | Default | Description |
+|---|---|---|
+| `rdma_memory_pool_initial_size_mb` | 1024 | Initial pool size in MB |
+| `rdma_memory_pool_increase_size_mb` | 1024 | Growth step in MB |
+| `rdma_memory_pool_max_regions` | 3 | Maximum number of registered regions |
+| `rdma_memory_pool_buckets` | 4 | Buckets to reduce mutex contention inside the pool |
+| `rdma_memory_pool_tls_cache_num` | 128 | Thread-local cached blocks per thread |
+
+### Queue and receive settings
+
+| Flag | Default | Description |
+|---|---|---|
+| `rdma_sq_size` | 128 | Send Queue depth |
+| `rdma_rq_size` | 128 | Receive Queue depth |
+| `rdma_cqe_poll_once` | 32 | CQEs drained per `PollCq` call |
+| `rdma_recv_block_type` | `default` (8 KB) | Block size for receive buffers: `default` / `large` (64 KB) / `huge` (2 MB) |
+| `rdma_zerocopy_min_size` | 512 | Minimum message size for receive zero-copy (bytes) |
+| `rdma_recv_zerocopy` | true | Enable receive-side zero-copy |
+| `rdma_max_sge` | 0 (device max) | Maximum scatter-gather list length |
+
+### Device selection
+
+| Flag | Default | Description |
+|---|---|---|
+| `rdma_device` | `""` (first active) | IB device name |
+| `rdma_port` | 1 | Port number on the device |
+| `rdma_gid_index` | -1 (maximum index) | Index into the local GID table |
+
+### QP pre-allocation
+
+| Flag | Default | Description |
+|---|---|---|
+| `rdma_prepared_qp_size` | 128 | Size of each pre-allocated QP |
+| `rdma_prepared_qp_cnt` | 1024 | Number of QPs pre-allocated at startup |
+
+### Polling mode
+
+By default, `RdmaEndpoint` uses event-driven mode: completion events arrive on a dedicated fd and are processed by `EventDispatcher`. Polling mode spins on the CQ instead:
+
+| Flag | Default | Description |
+|---|---|---|
+| `rdma_use_polling` | false | Use polling instead of event-driven mode |
+| `rdma_poller_num` | 1 | Number of poller threads in polling mode |
+| `rdma_poller_yield` | false | Allow pollers to yield the CPU voluntarily |
+
+### EventDispatcher scheduling
+
+`event_dispatcher_edisp_unsched` is a global flag that affects both TCP and RDMA modes:
+
+| Value | Behavior |
+|---|---|
+| `false` (default) | EventDispatcher is schedulable (can be preempted by bthreads) |
+| `true` | EventDispatcher is unschedulable; last message processing is deferred to a new bthread |
+
+```bash
+# Both TCP and RDMA schedulable (default)
+-event_dispatcher_edisp_unsched=false
+
+# Both TCP and RDMA unschedulable
+-event_dispatcher_edisp_unsched=true
+```
+
+### Diagnostics
+
+| Flag | Default | Description |
+|---|---|---|
+| `rdma_trace_verbose` | false | Log RDMA connection events |
+| `rdma_disable_bthread` | false | Disable bthread scheduling (for debugging) |
+
+## Limitations and compatibility
+
+<Note>
+The transmit side can only send messages smaller than `recv_block_size` on the receive side. If the sender needs to transmit larger frames, increase `rdma_recv_block_type` to `large` (64 KB) or `huge` (2 MB) on both sides.
+</Note>
+
+<Note>
+All RDMA memory consumed by `IOBuf` comes from the registered pool. Monitor pool exhaustion in long-running services. Increase `rdma_memory_pool_initial_size_mb` or `rdma_memory_pool_max_regions` if allocation failures appear in logs.
+</Note>
+
+- RDMA connections require a working TCP connection for the initial handshake. Firewall rules that block TCP will also prevent RDMA connections.
+- Only Linux builds are supported and tested. macOS and Windows are not supported.
+- RoCE v2 and InfiniBand are both supported. Select the correct `rdma_gid_index` for your fabric type (RoCE v2 GIDs have a different format than InfiniBand GIDs).
+- `mmap` count on the host must be large enough to accommodate pool allocations. Check `/proc/sys/vm/max_map_count` if pool initialization fails.

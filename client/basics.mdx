@@ -1,0 +1,300 @@
+---
+title: "Client Basics"
+description: "Learn the fundamentals of making RPC calls in bRPC: Channel initialization, synchronous and asynchronous calls, error handling, and key ChannelOptions."
+---
+
+# Client Basics
+
+bRPC has no class named `brpc::Client`. The client-side abstraction is called **Channel** — a communication line to one server or a cluster of servers that can be shared across all threads in your process.
+
+<Note>
+`Channel::Init()` is **not** thread-safe. Initialize your channel once at startup and reuse it from any number of threads. `Channel::CallMethod()` is thread-safe.
+</Note>
+
+## The Channel Concept
+
+A `Channel` represents a logical connection to a server or cluster. Key properties:
+
+- **Thread-safe for calling**: multiple threads can call `CallMethod` on the same `Channel` simultaneously without locking.
+- **Initialize once**: create and `Init()` a `Channel` at program startup, then share it everywhere.
+- **Can live on the stack**: `Channel` does not need to be heap-allocated.
+- **Can be destroyed after async send**: destroying a `Channel` immediately after an asynchronous `CallMethod` is safe.
+
+## Your First RPC
+
+<Steps>
+  <Step title="Initialize a Channel">
+    Connect a channel to a single server by address or hostname:
+
+    ```c++
+    #include <brpc/channel.h>
+
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.protocol = brpc::PROTOCOL_BAIDU_STD; // default protocol
+    options.timeout_ms = 1000;                   // 1-second RPC deadline
+    options.max_retry = 3;
+
+    // Connect by host:port
+    if (channel.Init("127.0.0.1:8000", &options) != 0) {
+        LOG(ERROR) << "Fail to initialize channel";
+        return -1;
+    }
+    ```
+
+    Valid address formats: `127.0.0.1:80`, `www.foo.com:8765`, `localhost:9000`.
+
+    <Tip>
+    Do not create a new `Channel` before each RPC. Channels are heavyweight objects. Create them once and reuse them.
+    </Tip>
+  </Step>
+
+  <Step title="Create a Stub">
+    Protobuf generates a `_Stub` class for each service. The stub wraps the channel and provides typed method calls. Stubs are cheap — put them on the stack:
+
+    ```c++
+    // Generated from your .proto file:
+    // service EchoService { rpc Echo(EchoRequest) returns (EchoResponse); }
+
+    EchoService_Stub stub(&channel);
+    ```
+
+    A stub has very few member fields and is suitable (and recommended) for stack allocation. Stubs are also thread-safe and can be shared.
+  </Step>
+
+  <Step title="Prepare Controller, Request, and Response">
+    Every RPC call needs a `brpc::Controller` to carry per-call settings and results:
+
+    ```c++
+    brpc::Controller cntl;
+    EchoRequest request;
+    EchoResponse response;
+
+    request.set_message("hello world");
+    cntl.set_timeout_ms(500); // override channel-level timeout for this call
+    ```
+
+    For synchronous calls, controller and response can live on the stack. For asynchronous calls, they **must** be heap-allocated (see below).
+  </Step>
+
+  <Step title="Make the Call">
+    Pass `NULL` as the `done` callback to make a synchronous (blocking) call:
+
+    ```c++
+    stub.Echo(&cntl, &request, &response, NULL /*done = sync*/);
+    ```
+  </Step>
+
+  <Step title="Handle Errors">
+    Check `cntl.Failed()` after the call:
+
+    ```c++
+    if (cntl.Failed()) {
+        LOG(ERROR) << "RPC failed: [" << cntl.ErrorCode() << "] "
+                   << cntl.ErrorText();
+    } else {
+        LOG(INFO) << "Got reply: " << response.message();
+    }
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Sync vs Async vs Semi-Sync Calls
+
+<Tabs>
+  <Tab title="Synchronous">
+    `CallMethod` blocks until the server replies or an error occurs (including timeout). Request, response, and controller can all be stack-allocated.
+
+    ```c++
+    MyRequest request;
+    MyResponse response;
+    brpc::Controller cntl;
+    XXX_Stub stub(&channel);
+
+    request.set_foo(...);
+    cntl.set_timeout_ms(500);
+    stub.some_method(&cntl, &request, &response, NULL);
+
+    if (cntl.Failed()) {
+        // RPC failed. Fields in response are undefined — do not use.
+        LOG(ERROR) << cntl.ErrorText();
+    } else {
+        // RPC succeeded.
+    }
+    ```
+
+    <Warning>
+    Do **not** hold a pthread mutex while making a synchronous call. This can cause deadlocks. Either replace the mutex with `bthread_mutex_t` or release the lock before calling.
+    </Warning>
+  </Tab>
+
+  <Tab title="Asynchronous">
+    Pass a `done` callback. `CallMethod` returns as soon as the request is sent; `done->Run()` is called when the reply arrives or an error occurs.
+
+    Response, controller, and `done` must be heap-allocated because they outlive `CallMethod`:
+
+    ```c++
+    static void OnRPCDone(MyResponse* response, brpc::Controller* cntl) {
+        // unique_ptr deletes response/cntl automatically on scope exit.
+        std::unique_ptr<MyResponse> response_guard(response);
+        std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+
+        if (cntl->Failed()) {
+            // RPC failed. Fields in response are undefined.
+            LOG(ERROR) << cntl->ErrorText();
+        } else {
+            // RPC succeeded. Process the response.
+        }
+        // The Closure created by NewCallback deletes itself at the end of Run().
+    }
+
+    MyResponse* response = new MyResponse;
+    brpc::Controller* cntl = new brpc::Controller;
+    MyService_Stub stub(&channel);
+
+    MyRequest request; // request can still be stack-allocated even for async calls
+    request.set_foo(...);
+    cntl->set_timeout_ms(500);
+    stub.some_method(cntl, &request, response,
+                     brpc::NewCallback(OnRPCDone, response, cntl));
+    // CallMethod returns here immediately; OnRPCDone is called later in a bthread.
+    ```
+
+    <Note>
+    The callback runs in a **different bthread** than the caller, even if the RPC fails immediately. `Channel` and `Request` can be destroyed right after `CallMethod` returns.
+    </Note>
+  </Tab>
+
+  <Tab title="Semi-Synchronous">
+    Launch multiple RPCs in parallel, then wait for all of them. This is called "semi-synchronous" because the callsite blocks, but multiple RPCs run concurrently. Response and controller can be stack-allocated since the callsite waits before returning.
+
+    ```c++
+    brpc::Controller cntl1;
+    brpc::Controller cntl2;
+    MyResponse response1;
+    MyResponse response2;
+
+    // Save call IDs BEFORE launching RPCs.
+    // call_id() after the call is unsafe because done may delete the controller.
+    const brpc::CallId cid1 = cntl1.call_id();
+    const brpc::CallId cid2 = cntl2.call_id();
+
+    // Launch both RPCs with DoNothing() — a no-op callback managed by brpc.
+    stub1.method1(&cntl1, &request1, &response1, brpc::DoNothing());
+    stub2.method2(&cntl2, &request2, &response2, brpc::DoNothing());
+
+    // Block until both complete.
+    brpc::Join(cid1);
+    brpc::Join(cid2);
+
+    if (cntl1.Failed()) { LOG(ERROR) << cntl1.ErrorText(); }
+    if (cntl2.Failed()) { LOG(ERROR) << cntl2.ErrorText(); }
+    ```
+
+    <Tip>
+    Consider using `ParallelChannel` for fan-out patterns — it handles this boilerplate for you. See [Combo Channels](/client/combo-channels).
+    </Tip>
+  </Tab>
+</Tabs>
+
+---
+
+## Cancelling an RPC
+
+To cancel an in-flight RPC, use `brpc::StartCancel(call_id)` with the ID saved **before** launching the call:
+
+```c++
+const brpc::CallId cid = cntl.call_id(); // save BEFORE CallMethod
+stub.SomeMethod(&cntl, &request, &response, done);
+
+// Later, from any thread:
+brpc::StartCancel(cid);
+```
+
+<Warning>
+Use `brpc::StartCancel(call_id)`, **not** `controller->StartCancel()`. The latter has race conditions on the lifetime of the controller and must not be used.
+</Warning>
+
+---
+
+## ChannelOptions Reference
+
+`brpc::ChannelOptions` is set once at `Channel::Init()` time and is immutable thereafter.
+
+<ParamField path="timeout_ms" type="int32_t" default="500">
+  Maximum duration of any RPC over this channel in milliseconds. `-1` means wait indefinitely. Can be overridden per-call with `Controller::set_timeout_ms()`.
+</ParamField>
+
+<ParamField path="connect_timeout_ms" type="int32_t" default="200">
+  Maximum time to establish a connection in milliseconds. `-1` means no deadline. Capped at `timeout_ms` automatically.
+</ParamField>
+
+<ParamField path="max_retry" type="int" default="3">
+  Number of times to retry a failed RPC. `0` disables retries. Overridable with `Controller::set_max_retry()`. Retries are only triggered by broken connections, not by server-side errors.
+</ParamField>
+
+<ParamField path="backup_request_ms" type="int32_t" default="-1 (disabled)">
+  If a response is not received within this many milliseconds, send a duplicate request to a different server and take whichever reply arrives first. Must be less than `timeout_ms` to have any effect.
+</ParamField>
+
+<ParamField path="protocol" type="AdaptiveProtocolType" default="baidu_std">
+  Wire protocol to use. Accepts enum values (`PROTOCOL_BAIDU_STD`, `PROTOCOL_HTTP`, `PROTOCOL_H2`, etc.) or their string names (`"baidu_std"`, `"http"`, `"h2"`).
+</ParamField>
+
+<ParamField path="connection_type" type="AdaptiveConnectionType" default="">
+  Connection reuse strategy: `"single"`, `"pooled"`, or `"short"`. Leave empty to use the protocol's default (recommended).
+</ParamField>
+
+<ParamField path="enable_circuit_breaker" type="bool" default="false">
+  When enabled, servers with high error rates are temporarily isolated globally across all channels in the process.
+</ParamField>
+
+---
+
+## Error Handling
+
+After any RPC call (sync or via callback), inspect the controller:
+
+```c++
+if (cntl.Failed()) {
+    // Numeric code — compare against brpc::ERPCTIMEDOUT, brpc::EHTTP, etc.
+    int error_code = cntl.ErrorCode();
+
+    // Human-readable description of the error.
+    std::string error_text = cntl.ErrorText();
+
+    // Address the RPC was sent to (only valid after RPC completes).
+    LOG(INFO) << "Failed RPC sent to " << cntl.remote_side();
+}
+```
+
+Common error codes:
+
+| Code | Meaning |
+|------|---------|
+| `ERPCTIMEDOUT` (1008) | RPC deadline exceeded — no retries will be attempted |
+| `ETIMEDOUT` | Connection timeout — retriable |
+| `EHTTP` | HTTP/H2 protocol error — check `cntl.http_response().status_code()` |
+| `EREQUEST` | Bad request — server rejected it; no retry |
+
+<Note>
+`ERPCTIMEDOUT` is the deadline for the entire RPC including all retries. `ETIMEDOUT` is a connection-level timeout and is retriable.
+</Note>
+
+---
+
+## Reusing a Controller
+
+Calling `cntl.Reset()` resets all fields so the same `Controller` object can be used for a subsequent RPC:
+
+```c++
+brpc::Controller cntl;
+for (int i = 0; i < n; ++i) {
+    cntl.Reset();
+    stub.SomeMethod(&cntl, &request, &response, NULL);
+}
+```
+
+This is equivalent in most cases to constructing a new `Controller` on each iteration. Only prefer reuse if heap-allocation shows up as a hotspot in profiling.

@@ -1,0 +1,85 @@
+---
+title: "Introduction"
+description: "bRPC is an industrial-grade C++ RPC framework built for high-performance systems—search, storage, machine learning, advertising, and recommendation."
+---
+
+# What is bRPC?
+
+bRPC ("better RPC") is a C++ RPC framework developed at Baidu and deployed across millions of service instances. It abstracts network communication as function calls between services while handling the low-level concerns: serialization, connection pooling, load balancing, retries, and observability.
+
+Where raw TCP requires you to define your own framing, byte-order handling, versioning strategy, connection reuse, and cluster routing, bRPC solves all of these out of the box while exposing a simple, three-header API surface.
+
+## Core architectural concepts
+
+**`brpc::Server`** — The server-side component. Hosts one or more protobuf service implementations. A single server can accept connections speaking different protocols on the same port simultaneously.
+
+**`brpc::Channel`** — The client-side component. Represents a communication line to one server or a cluster. Channels are thread-safe and intended to be shared across threads. There is no separate "ClientManager" or "ConnectionPool" class—Channel handles all of that internally.
+
+**`brpc::Controller`** — Per-RPC parameter container shared by both client and server. Carries metadata that cannot fit in the request/response protobuf messages: timeouts, log IDs, remote address, compression settings, attachments, and error information. On the server side it is cast from `google::protobuf::RpcController*`.
+
+**bthread** — bRPC's user-space threading primitive. The framework creates a new bthread for each incoming request. M bthreads are multiplexed onto N OS worker threads (M ≫ N), yielding high concurrency without thread-per-request overhead. bthreads can block on I/O and synchronization primitives without stalling OS threads.
+
+## Performance highlights
+
+bRPC is designed to extract maximum throughput and minimum latency from the hardware:
+
+- **Fully parallelized I/O**: Reading requests from different connections is parallelized at the message level. Parsing a large message from one connection does not delay messages from any other connection.
+- **Wait-free writes**: When multiple threads write to the same connection, the first thread writes in place and others enqueue in a wait-free manner. A single connection can sustain ~5,000,000 small messages per second under contention.
+- **Minimal locking**: Creating bthreads, setting timeouts, correlating responses, and recording metrics are all highly concurrent. Services running at 500,000+ QPS observe very little lock contention from the framework itself.
+- **Adaptive thread count**: The number of active worker threads scales automatically with load. Unlike traditional servers that pre-allocate a fixed thread pool, bRPC neither under-provisions nor wastes threads.
+
+## Protocol support
+
+A single bRPC server port can speak multiple protocols simultaneously. The framework detects the protocol from the incoming bytes—no per-protocol listener configuration needed.
+
+| Protocol | Notes |
+|---|---|
+| `baidu_std` | Default binary protocol; single connection |
+| HTTP/1.0, HTTP/1.1 | Full REST support; JSON ↔ protobuf conversion built in |
+| HTTP/2 and gRPC | `h2c` (plain) and `h2` (TLS) |
+| Redis | Thread-safe client; more ergonomic than hiredis |
+| Memcached | Thread-safe client |
+| Thrift | Thread-safe; more performant than the official client |
+| RTMP / FLV / HLS | Streaming media protocols |
+| Streaming RPC | Application-level streaming over a single connection |
+| sofa-pbrpc, hulu-pbrpc, nova-pbrpc | Internal Baidu protocols |
+
+## Explore bRPC
+
+<CardGroup cols={2}>
+  <Card title="Getting started" icon="download" href="/getting-started">
+    Install dependencies, build bRPC from source, and verify the installation by running the echo example.
+  </Card>
+  <Card title="Quickstart: Server" icon="server" href="/quickstart-server">
+    Define a proto service, implement it in C++, and start a bRPC server in four steps.
+  </Card>
+  <Card title="Quickstart: Client" icon="plug" href="/quickstart-client">
+    Create a Channel, build a stub, and make synchronous and asynchronous RPC calls.
+  </Card>
+  <Card title="GitHub repository" icon="github" href="https://github.com/apache/brpc">
+    Browse source code, file issues, and contribute to the project on Apache GitHub.
+  </Card>
+</CardGroup>
+
+## Frequently asked questions
+
+<AccordionGroup>
+  <Accordion title="Should I use RPC instead of raw TCP?">
+    In most cases, yes. Raw TCP only guarantees byte delivery. You still need to define a framing format, handle byte-order differences, manage field additions without breaking older clients, decide whether to reuse connections, implement timeouts and retries, and discover servers in a cluster. RPC handles all of this. The only scenario where raw TCP is clearly preferable is when you are transferring large binary blobs and the serialization overhead of any framing format is genuinely unacceptable—but even then bRPC's attachment mechanism lets you send raw bytes alongside a protobuf control message without serializing the payload.
+  </Accordion>
+  <Accordion title="What if my data is binary and large? Won't protobuf be slow?">
+    Protobuf serialization overhead is usually much smaller than perceived. Profile first. If serialization is genuinely a bottleneck, bRPC's attachment feature lets you attach arbitrary binary data to a request or response and bypass protobuf serialization entirely. The attachment is wired directly to the network.
+  </Accordion>
+  <Accordion title="Can bRPC handle streaming data?">
+    Yes. Multiple mechanisms are available: `ProgressiveReader` for HTTP, native streams in HTTP/2, the `streaming_rpc` protocol for bRPC-to-bRPC streaming, and RTMP for real-time media. Raw "fire and forget" patterns are also supported but bRPC recommends sending small acknowledgement responses so that dropped requests can be detected.
+  </Accordion>
+  <Accordion title="Is bRPC thread-safe?">
+    `Channel::CallMethod()` is thread-safe; a single Channel can be shared by all threads in your process. `Channel::Init()` is not thread-safe and must be called from one thread before the Channel is shared. `brpc::Server` is thread-safe after `Start()`. Individual `brpc::Controller` instances are not thread-safe and must not be shared between threads.
+  </Accordion>
+  <Accordion title="Does bRPC work on macOS?">
+    Yes, macOS is supported and used for development. However, the macOS version delivers lower throughput than Linux due to OS-level differences in I/O and threading. Do not use macOS in production for performance-critical services.
+  </Accordion>
+  <Accordion title="How does bRPC compare to gRPC?">
+    bRPC supports gRPC's wire protocol (`h2:grpc`) so the two are interoperable. The main differences are: bRPC exposes a richer set of protocols on a single port, its built-in observability (cpu/heap/contention profilers, `/vars`, `/status`, `/rpcz`) requires no external setup, and bthread scheduling is tailored for low-latency request processing. gRPC has broader multi-language support and a larger ecosystem outside of C++.
+  </Accordion>
+</AccordionGroup>

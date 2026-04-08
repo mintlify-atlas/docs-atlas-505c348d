@@ -1,97 +1,71 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "bRPC Documentation"
+description: "An industrial-grade C++ RPC framework for high-performance distributed systems"
 ---
 
-## Setting up
+bRPC is an industrial-grade RPC framework written in C++, designed for high-performance systems at massive scale. Used throughout Baidu with over 1,000,000 server instances, bRPC supports multiple protocols on a single port, user-space threading via bthread, and comprehensive built-in observability.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what bRPC is, why it was built, and where it excels in distributed systems.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Getting Started" icon="rocket" href="/getting-started">
+    Install dependencies and build bRPC on Ubuntu, CentOS, macOS, or Docker.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Build a Server" icon="server" href="/quickstart-server">
+    Define a protobuf service and run your first bRPC server in minutes.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Build a Client" icon="plug" href="/quickstart-client">
+    Connect to a bRPC server using Channel and call services synchronously or asynchronously.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Explore by area
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Server Guide" icon="tower-broadcast" href="/server/basics">
+    Handle synchronous and asynchronous requests, configure timeouts, and manage server lifecycle.
+  </Card>
+  <Card title="Client Guide" icon="network-wired" href="/client/basics">
+    Use channels, naming services, load balancers, and retry policies to call remote services reliably.
+  </Card>
+  <Card title="HTTP & gRPC" icon="globe" href="/server/http-service">
+    Serve RESTful HTTP/HTTPS, HTTP/2, and gRPC — all on the same port as your protobuf services.
+  </Card>
+  <Card title="Combo Channels" icon="diagram-project" href="/client/combo-channels">
+    Fan out requests with ParallelChannel or add HA with SelectiveChannel.
+  </Card>
+  <Card title="bthread" icon="microchip" href="/core/bthread">
+    M:N user-space threading that scales to millions of concurrent RPCs with minimal overhead.
+  </Card>
+  <Card title="bvar & Metrics" icon="chart-bar" href="/core/bvar">
+    Low-overhead counters and latency recorders with automatic /vars HTTP endpoint.
+  </Card>
+  <Card title="Builtin Services" icon="magnifying-glass-chart" href="/server/builtin-services">
+    Debug servers via browser or curl — view status, connections, flags, rpcz, and profilers.
+  </Card>
+  <Card title="Custom Protocols" icon="puzzle-piece" href="/advanced/new-protocol">
+    Add new wire protocols to bRPC and integrate with naming services and load balancers.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Why bRPC?
 
-## Need inspiration?
+<AccordionGroup>
+  <Accordion title="Multi-protocol on a single port">
+    bRPC servers accept baidu_std, HTTP/1.1, HTTP/2, gRPC, Redis, Memcached, Thrift, RTMP, and more — all on the same listening port. The protocol is auto-detected per connection, simplifying deployment.
+  </Accordion>
+  <Accordion title="High-throughput, low-latency I/O">
+    Reading from different file descriptors is fully parallelized. Writing to a single fd from multiple threads uses a wait-free queue. A single fd can handle 5,000,000 16-byte messages per second under heavy contention.
+  </Accordion>
+  <Accordion title="User-space threading with bthread">
+    bRPC creates one bthread per request and ends it when done, automatically scaling concurrency with load. bthreads are M:N multiplexed over kernel threads, giving you the coding simplicity of synchronous code without blocking OS threads.
+  </Accordion>
+  <Accordion title="Built-in observability">
+    Every bRPC server exposes `/status`, `/vars`, `/connections`, `/flags`, `/rpcz`, and on-demand CPU, heap, and contention profilers — accessible from any browser or `curl`.
+  </Accordion>
+</AccordionGroup>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+  bRPC is an Apache Software Foundation project. Source code is available at [github.com/apache/brpc](https://github.com/apache/brpc) under the Apache-2.0 license.
+</Note>

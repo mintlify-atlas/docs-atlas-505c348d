@@ -1,0 +1,283 @@
+---
+title: "Streaming RPC"
+description: "Send large or continuous data between client and server using bRPC streams—ordered, flow-controlled, full-duplex connections over shared TCP."
+---
+
+## When to use streaming RPC
+
+Standard RPC is request/response: the client sends a message and waits for a reply. This works poorly when:
+
+- **Data is large**: sending a 1 GB snapshot in a single attachment blocks resources for the whole transfer
+- **Data grows over time**: replication logs, live metrics, or sensor feeds arrive continuously
+- **Parallel chunked RPCs don't work**: out-of-order delivery requires complex reassembly logic
+- **Serial chunked RPCs are too slow**: each chunk pays a full network round-trip
+
+Streaming RPC solves these problems by establishing a **Stream**—a user-space, ordered, flow-controlled channel multiplexed over an existing TCP connection. The sender writes messages continuously; the receiver reads them in the same order.
+
+bRPC streams provide:
+
+- Guaranteed message ordering (receiver sees messages in send order)
+- Message boundary preservation
+- Full duplex (both sides can read and write simultaneously)
+- Flow control (sender blocks or gets `EAGAIN` when the receiver is slow)
+- Idle timeout notification
+- Automatic segmentation of large messages to avoid head-of-line blocking
+
+## Stream lifecycle
+
+<Steps>
+  <Step title="Client creates the stream">
+    Streams are always initiated by the client. `StreamCreate` attaches a stream to an RPC controller before the call is made.
+
+    ```c++
+    #include <brpc/stream.h>
+
+    brpc::StreamId request_stream;
+    brpc::StreamOptions stream_options;
+    stream_options.handler = &my_handler; // StreamInputHandler implementation
+
+    if (brpc::StreamCreate(&request_stream, cntl, &stream_options) != 0) {
+        LOG(ERROR) << "Fail to create stream";
+        return -1;
+    }
+    // Issue the RPC normally; the stream is established on success
+    stub.SomeMethod(&cntl, &request, &response, NULL/*sync*/);
+    ```
+  </Step>
+
+  <Step title="Server accepts the stream">
+    Inside the server-side RPC method, call `StreamAccept` to obtain a `StreamId` for sending back to the client.
+
+    ```c++
+    void SomeMethod(google::protobuf::RpcController* cntl_base,
+                    const SomeRequest* request,
+                    SomeResponse* response,
+                    google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl =
+            static_cast<brpc::Controller*>(cntl_base);
+
+        brpc::StreamId response_stream;
+        brpc::StreamOptions stream_options;
+        stream_options.handler = &server_handler;
+
+        if (brpc::StreamAccept(&response_stream, *cntl,
+                                &stream_options) != 0) {
+            cntl->SetFailed("Client did not create a stream");
+            return;
+        }
+        // Stream is established once done->Run() is called
+    }
+    ```
+
+    <Note>
+      `on_received_messages` is not called until `done->Run()` finishes on the
+      server side, so the server's RPC handler must return (or release `done`)
+      before any stream data is delivered to the handler.
+    </Note>
+  </Step>
+
+  <Step title="Write messages to the stream">
+    Both sides can write after the stream is established.
+
+    ```c++
+    butil::IOBuf message;
+    message.append("hello from server");
+
+    int rc = brpc::StreamWrite(response_stream, message);
+    if (rc == EAGAIN) {
+        // Remote side hasn't consumed buffered data yet; wait or retry
+        brpc::StreamWait(response_stream, NULL/*no timeout*/);
+        rc = brpc::StreamWrite(response_stream, message);
+    }
+    if (rc != 0) {
+        LOG(ERROR) << "StreamWrite failed: " << berror(rc);
+    }
+    ```
+  </Step>
+
+  <Step title="Handle incoming messages via StreamInputHandler">
+    Implement `brpc::StreamInputHandler` to receive messages asynchronously.
+
+    ```c++
+    class MyStreamHandler : public brpc::StreamInputHandler {
+    public:
+        // Called when one or more messages arrive
+        int on_received_messages(brpc::StreamId id,
+                                   butil::IOBuf* const messages[],
+                                   size_t size) override {
+            for (size_t i = 0; i < size; ++i) {
+                LOG(INFO) << "Received: " << *messages[i];
+            }
+            return 0;
+        }
+
+        // Called when no data has arrived for idle_timeout_ms
+        void on_idle_timeout(brpc::StreamId id) override {
+            LOG(WARNING) << "Stream " << id << " idle timeout";
+        }
+
+        // Called when the stream is closed abnormally (before on_closed)
+        void on_failed(brpc::StreamId id, int error_code,
+                       const std::string& error_text) override {
+            LOG(ERROR) << "Stream " << id << " error " << error_code
+                       << ": " << error_text;
+        }
+
+        // Called when the remote side closes the stream
+        void on_closed(brpc::StreamId id) override {
+            LOG(INFO) << "Stream " << id << " closed";
+        }
+    };
+    ```
+  </Step>
+
+  <Step title="Close the stream">
+    Either side can close the stream. Pending writes are delivered before `on_closed` is called on both sides.
+
+    ```c++
+    brpc::StreamClose(response_stream);
+    ```
+
+    After `StreamClose`:
+    - All subsequent `StreamWrite` calls fail
+    - Any blocked `StreamWait` returns immediately
+    - Both sides receive `on_closed` after all buffered data is consumed
+  </Step>
+</Steps>
+
+## StreamOptions reference
+
+```c++
+struct StreamOptions {
+    // Min bytes the sender can buffer. <= 0 means no minimum.
+    // Default: 1048576 (1 MB)
+    int min_buf_size;
+
+    // Max bytes of data the remote side may buffer before the sender gets
+    // EAGAIN. <= 0 means unlimited.
+    // Default: 2097152 (2 MB)
+    int max_buf_size;
+
+    // Fire on_idle_timeout when no data has been received for this many
+    // milliseconds (measured from the end of the last on_received_messages
+    // or on_idle_timeout call).
+    // Default: -1 (disabled)
+    long idle_timeout_ms;
+
+    // Maximum number of messages delivered to on_received_messages in one call.
+    // Default: 128
+    size_t messages_in_batch;
+
+    // Handler for incoming data. If NULL, the remote side is not allowed to
+    // write; attempts will fail with EBADF.
+    // Default: NULL
+    StreamInputHandler* handler;
+};
+```
+
+## StreamInputHandler interface
+
+```c++
+class StreamInputHandler {
+public:
+    // Invoked when one or more messages arrive on the stream.
+    // |messages| is an array of |size| IOBuf pointers.
+    // Return 0 to continue; non-zero to signal an error.
+    virtual int on_received_messages(StreamId id,
+                                      butil::IOBuf* const messages[],
+                                      size_t size) = 0;
+
+    // Invoked when no data has arrived for at least idle_timeout_ms.
+    virtual void on_idle_timeout(StreamId id) = 0;
+
+    // Invoked when the remote side has closed the stream.
+    virtual void on_closed(StreamId id) = 0;
+
+    // Invoked before on_closed when the stream is closed due to an error.
+    // error_code and error_text describe the failure. Default: no-op.
+    virtual void on_failed(StreamId id, int error_code,
+                           const std::string& error_text) {}
+};
+```
+
+## Flow control
+
+`StreamWrite` returns `EAGAIN` when the remote side's unconsumed buffer reaches `max_buf_size`. Use `StreamWait` to block or poll until space is available.
+
+```c++
+// Synchronous wait (blocks until buffer drains or error)
+int rc = brpc::StreamWait(stream_id, NULL /*no deadline*/);
+
+// Wait with a deadline
+timespec deadline = butil::seconds_from_now(5);
+int rc = brpc::StreamWait(stream_id, &deadline);
+// rc == ETIMEDOUT if deadline expires before buffer drains
+
+// Asynchronous wait
+brpc::StreamWait(stream_id, NULL,
+    [](brpc::StreamId id, void* arg, int error_code) {
+        if (error_code == 0) {
+            // Safe to write again
+        }
+    },
+    my_arg);
+```
+
+## Creating multiple streams per RPC
+
+```c++
+// Client side
+brpc::StreamIds request_streams;
+if (brpc::StreamCreate(request_streams, /*count=*/2, cntl,
+                        &stream_options) != 0) {
+    LOG(ERROR) << "Fail to create streams";
+}
+
+// Server side
+brpc::StreamIds response_streams;
+if (brpc::StreamAccept(response_streams, *cntl,
+                        &stream_options) != 0) {
+    cntl->SetFailed("Failed to accept streams");
+}
+```
+
+## Full duplex example
+
+Both client and server can read and write on their respective `StreamId` values simultaneously after the initial RPC completes.
+
+```c++
+// --- SERVER SIDE ---
+class StreamingServiceImpl : public StreamingService {
+    MyStreamHandler _handler;
+public:
+    void StartStream(google::protobuf::RpcController* cntl_base,
+                     const StartRequest* /*request*/,
+                     StartResponse* /*response*/,
+                     google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl =
+            static_cast<brpc::Controller*>(cntl_base);
+
+        brpc::StreamId sid;
+        brpc::StreamOptions opts;
+        opts.handler = &_handler;       // receive client → server messages
+        opts.idle_timeout_ms = 10000;   // warn after 10s of silence
+
+        if (brpc::StreamAccept(&sid, *cntl, &opts) != 0) {
+            cntl->SetFailed("No stream in request");
+            return;
+        }
+
+        // Send initial message to client
+        butil::IOBuf buf;
+        buf.append("stream established");
+        brpc::StreamWrite(sid, buf);
+    }
+};
+```
+
+<Tip>
+  For a complete working example see
+  `example/streaming_echo_c++/` in the bRPC source tree.
+</Tip>

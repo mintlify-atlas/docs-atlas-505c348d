@@ -1,0 +1,310 @@
+---
+title: "Server basics"
+description: "Full lifecycle of a bRPC server: defining services, configuring options, starting, and stopping gracefully."
+---
+
+bRPC servers serve one or more protobuf services on a single port and can handle multiple protocols simultaneously—baidu\_std, HTTP/1.1, HTTP/2, gRPC, and more—without any extra configuration.
+
+## Define the service interface
+
+Interfaces are declared in a `.proto` file. Set `cc_generic_services = true` so protoc generates the C++ base classes you will implement.
+
+```protobuf
+// echo.proto
+option cc_generic_services = true;
+
+message EchoRequest {
+    required string message = 1;
+}
+
+message EchoResponse {
+    required string message = 1;
+}
+
+service EchoService {
+    rpc Echo(EchoRequest) returns (EchoResponse);
+}
+```
+
+Run protoc to generate `echo.pb.h` and `echo.pb.cc`, then implement the generated base class.
+
+## Server lifecycle
+
+<Steps>
+  <Step title="Implement the service">
+    Inherit from the generated base class and override each RPC method. Every method receives four parameters:
+
+    - `cntl_base` — castable to `brpc::Controller`; carries metadata that doesn't fit in request/response
+    - `request` — read-only message from the client
+    - `response` — filled by your implementation; any missing `required` field causes the RPC to fail
+    - `done` — must be called exactly once when processing is complete
+
+    Use `brpc::ClosureGuard` to guarantee `done->Run()` is always called, even on early returns.
+
+    <Tabs>
+      <Tab title="Synchronous">
+        ```c++
+        #include "echo.pb.h"
+        #include <brpc/server.h>
+
+        class MyEchoService : public EchoService {
+        public:
+            void Echo(::google::protobuf::RpcController* cntl_base,
+                      const ::example::EchoRequest* request,
+                      ::example::EchoResponse* response,
+                      ::google::protobuf::Closure* done) {
+                // RAII: calls done->Run() automatically at scope exit
+                brpc::ClosureGuard done_guard(done);
+
+                brpc::Controller* cntl =
+                    static_cast<brpc::Controller*>(cntl_base);
+
+                // Fill the response
+                response->set_message(request->message());
+            }
+        };
+        ```
+      </Tab>
+      <Tab title="Asynchronous">
+        In an asynchronous service, processing continues after `CallMethod` returns. Call `done_guard.release()` before the successful return path to prevent `done->Run()` from firing too early. Store `done` (or the guard) in an event handler and call `done->Run()` when the work actually completes.
+
+        ```c++
+        class MyFooService : public FooService {
+        public:
+            void AsyncFoo(::google::protobuf::RpcController* cntl_base,
+                          const ::example::FooRequest* request,
+                          ::example::FooResponse* response,
+                          ::google::protobuf::Closure* done) {
+                brpc::ClosureGuard done_guard(done);
+
+                // ... schedule async work, store done somewhere ...
+
+                // Prevent done->Run() at function exit
+                done_guard.release();
+            }
+        };
+        ```
+
+        <Note>
+          `done` is created by the framework and sends the response back to the
+          client when called. You own the pointer after `release()`—you must call
+          `done->Run()` exactly once from your async callback.
+        </Note>
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Construct the server and add services">
+    A default-constructed `brpc::Server` contains no services. Add them before starting.
+
+    ```c++
+    brpc::Server server;
+    MyEchoService my_echo_service;
+
+    if (server.AddService(&my_echo_service,
+                          brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+        LOG(FATAL) << "Fail to add service";
+        return -1;
+    }
+    ```
+
+    `AddService` takes a `ServiceOwnership` flag:
+
+    | Flag | Behavior |
+    |------|----------|
+    | `SERVER_OWNS_SERVICE` | Server deletes the service on destruction |
+    | `SERVER_DOESNT_OWN_SERVICE` | Caller is responsible for the service lifetime |
+
+    <Warning>
+      Services cannot be added or removed after the server has been started.
+    </Warning>
+  </Step>
+
+  <Step title="Configure ServerOptions">
+    Pass a `brpc::ServerOptions` struct to `Start()` to control server behavior. All fields have sensible defaults.
+
+    ```c++
+    brpc::ServerOptions options;
+
+    // Number of worker pthreads (hint only; workers are shared across servers
+    // and channels in the same process). Default: number of CPU cores.
+    options.num_threads = 8;
+
+    // Max requests processed in parallel. Clients receive ELIMIT and should
+    // retry another server. 0 = unlimited. Default: 0.
+    options.max_concurrency = 1000;
+
+    // Close connections idle for this many seconds. -1 = disabled. Default: -1.
+    options.idle_timeout_sec = 60;
+
+    // Expose builtin services on a separate internal-only port,
+    // hiding them from public traffic. Default: -1 (use the main port).
+    options.internal_port = 8081;
+    ```
+
+    **Key `ServerOptions` fields**
+
+    | Field | Type | Default | Description |
+    |-------|------|---------|-------------|
+    | `num_threads` | `int` | CPU cores | Worker pthread count (hint) |
+    | `max_concurrency` | `int` | `0` | Max simultaneous requests (0 = unlimited) |
+    | `idle_timeout_sec` | `int` | `-1` | Seconds before closing idle connections |
+    | `internal_port` | `int` | `-1` | Port for builtin services (internal use only) |
+    | `has_builtin_services` | `bool` | `true` | Whether builtin HTTP services are served |
+    | `pid_file` | `string` | `""` | Path to write the server PID on startup |
+    | `auth` | `Authenticator*` | `NULL` | Client authentication handler |
+
+    <Tip>
+      `num_threads` is a **hint**. All servers and channels in the same process share a single worker pool. The actual thread count is the maximum of all `num_threads` values and `bthread_concurrency`.
+    </Tip>
+  </Step>
+
+  <Step title="Start the server">
+    `Start()` accepts several address forms:
+
+    ```c++
+    // Start listening on a specific port
+    if (server.Start(8765, &options) != 0) {
+        LOG(FATAL) << "Fail to start server";
+        return -1;
+    }
+
+    // Or with explicit IP and port
+    // server.Start("0.0.0.0:8765", &options);
+
+    // Or with a port range (picks the first available port)
+    // server.Start("0.0.0.0", brpc::PortRange(8000, 8100), &options);
+    ```
+  </Step>
+
+  <Step title="Run until asked to quit">
+    For most servers, `RunUntilAskedToQuit()` is the simplest way to block the main thread until Ctrl-C is pressed, then stop cleanly.
+
+    ```c++
+    // Blocks until SIGINT or SIGTERM, then calls Stop() + Join()
+    server.RunUntilAskedToQuit();
+
+    // Server is stopped. Release resources here.
+    ```
+  </Step>
+
+  <Step title="Stop gracefully">
+    When stopping manually, call `Stop()` first (non-blocking) and then `Join()` (blocks until all in-flight requests complete). Splitting them lets you stop multiple servers in parallel.
+
+    ```c++
+    server.Stop(0 /*unused*/);
+    server.Join();
+    ```
+
+    While draining, new requests receive `ELOGOFF` immediately. brpc clients that see `ELOGOFF` automatically retry another server, so a rolling restart of a cluster causes no traffic loss.
+
+    <Note>
+      If `Join()` never returns, a thread is blocked inside a request handler or
+      `done->Run()` was never called.
+    </Note>
+  </Step>
+</Steps>
+
+## Failing an RPC
+
+Call `controller->SetFailed()` to return an error to the client instead of a normal response.
+
+```c++
+void Echo(::google::protobuf::RpcController* cntl_base,
+          const ::example::EchoRequest* request,
+          ::example::EchoResponse* response,
+          ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+
+    if (request->message().empty()) {
+        cntl->SetFailed(brpc::EREQUEST, "message must not be empty");
+        return; // done_guard calls done->Run() here
+    }
+    response->set_message(request->message());
+}
+```
+
+For HTTP responses, you can also set the status code explicitly:
+
+```c++
+cntl->http_response().set_status_code(brpc::HTTP_STATUS_NOT_FOUND);
+```
+
+## Getting client and server addresses
+
+```c++
+// Client address (e.g. for logging or rate limiting)
+LOG(INFO) << "remote_side=" << cntl->remote_side();
+printf("remote_side=%s\n", butil::endpoint2str(cntl->remote_side()).c_str());
+
+// Local server address for this connection
+LOG(INFO) << "local_side=" << cntl->local_side();
+```
+
+## Concurrency limits
+
+brpc allows limiting concurrency at both server and method level. When the limit is exceeded, the server responds with `ELIMIT` immediately rather than queuing the request.
+
+```c++
+// Server-level: set in ServerOptions before Start()
+options.max_concurrency = 200;
+
+// Method-level: set after AddService, before Start()
+server.MaxConcurrencyOf("example.EchoService.Echo") = 10;
+server.MaxConcurrencyOf("example.EchoService", "Echo") = 10;
+server.MaxConcurrencyOf(&service, "Echo") = 10;
+
+// Automatic concurrency limiting (adaptive)
+options.method_max_concurrency = "auto";
+server.MaxConcurrencyOf("example.EchoService.Echo") = "auto";
+```
+
+The formula for a manual limit is:
+
+```
+max_concurrency = peak_qps × noload_latency   (Little's law)
+```
+
+## Security mode
+
+Builtin services expose internal details—service names, latency metrics, CPU profiles—that should never be visible to public clients.
+
+<Warning>
+  Always configure security mode on servers that accept public traffic, including
+  servers behind an nginx proxy.
+</Warning>
+
+There are three approaches:
+
+**Option 1 — Internal port**: Serve builtin services on a separate port reachable only from your internal network.
+
+```c++
+options.internal_port = 8081; // only accessible internally
+// Public port passed to Start() will return an error for /status, /vars, etc.
+```
+
+**Option 2 — Disable completely**: Disable all builtin services.
+
+```c++
+options.has_builtin_services = false;
+```
+
+**Option 3 — nginx URL allowlist**: Configure nginx to proxy only the specific API paths you intend to expose and block all others at the proxy layer.
+
+```nginx
+location /api/v1/ {
+    proxy_pass http://<target-server>/ServiceName/MethodName$query_string;
+}
+# /status, /vars, /flags etc. are never forwarded
+```
+
+Additionally, never enable `-enable_dir_service` or `-enable_threads_service` on public-facing servers.
+
+## Setting the server version
+
+```c++
+server.set_version("MyService/1.0.0");
+```
+
+The version string is accessible at `/version` in the builtin services.

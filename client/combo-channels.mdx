@@ -1,0 +1,369 @@
+---
+title: "Combo Channels"
+description: "Use ParallelChannel, SelectiveChannel, PartitionChannel, and DynamicPartitionChannel to compose complex fan-out, HA, and sharding access patterns with a unified Channel interface."
+---
+
+# Combo Channels
+
+As services grow, access patterns become more complex: fan-out to multiple backends simultaneously, sharding by partition key, or A/B routing between groups. Implementing these patterns ad-hoc with raw threads and callbacks leads to tricky race conditions, inconsistent sync/async code, and poor composability.
+
+bRPC solves this with **combo channels** — channel types that combine multiple sub-channels with a specific access strategy while exposing the same interface as a regular `Channel`:
+
+- Support synchronous and asynchronous access
+- Can be destroyed immediately after initiating an asynchronous operation
+- Support cancellation and timeout
+
+<Tabs>
+  <Tab title="ParallelChannel">
+    ## ParallelChannel
+
+    `ParallelChannel` (pchan) fans out the same RPC to **all** sub-channels simultaneously and merges the responses. Use it when you need to broadcast a request to N backends and aggregate results.
+
+    Any subclass of `brpc::ChannelBase` can be added as a sub-channel, including other combo channels.
+
+    ### Basic Setup
+
+    ```c++
+    #include <brpc/parallel_channel.h>
+
+    brpc::ParallelChannel pchan;
+    brpc::ParallelChannelOptions pchan_options;
+    pchan_options.timeout_ms = 1000;
+
+    // Add sub-channels. When ownership is OWNS_CHANNEL, pchan deletes it on destruction.
+    brpc::Channel* sub1 = new brpc::Channel;
+    sub1->Init("10.0.0.1:8000", NULL);
+    pchan.AddChannel(sub1, brpc::OWNS_CHANNEL,
+                     NULL /*CallMapper — NULL means broadcast*/,
+                     NULL /*ResponseMerger — NULL means MergeFrom*/);
+
+    brpc::Channel* sub2 = new brpc::Channel;
+    sub2->Init("10.0.0.2:8000", NULL);
+    pchan.AddChannel(sub2, brpc::OWNS_CHANNEL, NULL, NULL);
+
+    // Use pchan like any regular channel:
+    XXX_Stub stub(&pchan);
+    stub.SomeMethod(&cntl, &request, &response, NULL);
+    ```
+
+    ### Controlling Failures
+
+    ```c++
+    // Fail the whole RPC as soon as 1 sub-channel fails:
+    pchan_options.fail_limit = 1;
+
+    // Succeed as soon as 2 sub-channels succeed (fail_limit takes priority):
+    pchan_options.success_limit = 2;
+    ```
+
+    ### CallMapper — Customizing Sub-Requests
+
+    When `call_mapper` is `NULL`, every sub-channel receives the exact same request. To send different requests per sub-channel, implement `CallMapper::Map()`:
+
+    ```c++
+    class CallMapper {
+    public:
+        virtual SubCall Map(
+            int channel_index,   // position of sub-channel, starting from 0
+            int channel_count,   // total number of sub-channels
+            const google::protobuf::MethodDescriptor* method,
+            const google::protobuf::Message* request,
+            google::protobuf::Message* response) = 0;
+    };
+    ```
+
+    **Broadcast (same as NULL mapper):**
+
+    ```c++
+    class Broadcaster : public CallMapper {
+    public:
+        SubCall Map(int channel_index, int channel_count,
+                    const google::protobuf::MethodDescriptor* method,
+                    const google::protobuf::Message* request,
+                    google::protobuf::Message* response) {
+            // Reuse the same method/request; create a fresh response.
+            return SubCall(method, request, response->New(), DELETE_RESPONSE);
+        }
+    };
+    ```
+
+    **Modify a field per sub-channel:**
+
+    ```c++
+    class ModifyRequest : public CallMapper {
+    public:
+        SubCall Map(int channel_index, int channel_count,
+                    const google::protobuf::MethodDescriptor* method,
+                    const google::protobuf::Message* request,
+                    google::protobuf::Message* response) {
+            FooRequest* copied_req = brpc::Clone<FooRequest>(request);
+            copied_req->set_shard_index(channel_index);
+            // DELETE_REQUEST | DELETE_RESPONSE: pchan frees both after completion.
+            return SubCall(method, copied_req, response->New(),
+                           DELETE_REQUEST | DELETE_RESPONSE);
+        }
+    };
+    ```
+
+    **Use sub-request fields from the request itself:**
+
+    ```c++
+    class UseFieldAsSubRequest : public CallMapper {
+    public:
+        SubCall Map(int channel_index, int channel_count,
+                    const google::protobuf::MethodDescriptor* method,
+                    const google::protobuf::Message* request,
+                    google::protobuf::Message* response) {
+            if (channel_index >= request->sub_request_size()) {
+                // Not enough sub-requests — fail the RPC immediately.
+                return SubCall::Bad();
+            }
+            // 0 flag: pchan does not own/delete these objects.
+            return SubCall(sub_method,
+                           request->sub_request(channel_index),
+                           response->add_sub_response(), 0);
+        }
+    };
+    ```
+
+    Return `SubCall::Bad()` to fail the RPC with `EREQUEST`, or `SubCall::Skip()` to skip a sub-channel (if all are skipped, the RPC fails with `ECANCELED`).
+
+    ### ResponseMerger — Aggregating Results
+
+    When `response_merger` is `NULL`, bRPC calls `response->MergeFrom(*sub_response)` for each sub-response (protobuf repeated fields are appended, scalars are overwritten).
+
+    Implement `ResponseMerger` for custom logic. Return values:
+    - `MERGED` — sub-response merged successfully
+    - `FAIL` — count as one failure (checked against `fail_limit`)
+    - `FAIL_ALL` — fail the entire RPC immediately
+
+    ### Inspecting Sub-Channel Results
+
+    ```c++
+    // After the RPC, inspect per-sub-channel controllers:
+    for (int i = 0; i < cntl.sub_count(); ++i) {
+        const brpc::Controller* sub = cntl.sub(i);
+        if (sub == NULL) continue; // sub-channel was skipped or not reached
+        if (sub->Failed()) {
+            LOG(WARNING) << "Sub-channel " << i << " failed: " << sub->ErrorText();
+        }
+    }
+    ```
+
+    <Note>
+    `AddChannel` is **not** thread-safe while an RPC over the `ParallelChannel` is in progress. Add all sub-channels before starting any RPC.
+    </Note>
+  </Tab>
+
+  <Tab title="SelectiveChannel">
+    ## SelectiveChannel
+
+    `SelectiveChannel` (schan) picks **one** sub-channel per RPC according to a load-balancing algorithm. Unlike a regular channel (which picks one server), schan picks one *channel* (which may itself be a cluster channel). Use it for:
+
+    - **High availability**: route to one of several naming services
+    - **A/B testing**: divide traffic between two channel configurations
+    - **Group-level load balancing**: pick a group, then use that group's internal LB
+
+    Retries done by `SelectiveChannel` are independent from retries inside sub-channels. When a sub-channel call fails (even after its own retries), schan retries with a different sub-channel.
+
+    <Warning>
+    `SelectiveChannel` requires the **request to remain valid until the RPC completes**, unlike regular channels. For asynchronous use, delete the request inside `done`.
+    </Warning>
+
+    ### Setup
+
+    ```c++
+    #include <brpc/selective_channel.h>
+
+    brpc::SelectiveChannel schan;
+    brpc::ChannelOptions schan_options;
+    schan_options.timeout_ms = FLAGS_timeout_ms;
+    schan_options.max_retry = FLAGS_max_retry;
+
+    // Load balancer name controls how schan selects among sub-channels.
+    if (schan.Init("c_murmurhash", &schan_options) != 0) {
+        LOG(ERROR) << "Fail to init SelectiveChannel";
+        return -1;
+    }
+    ```
+
+    ### Adding Sub-Channels
+
+    ```c++
+    brpc::Channel* sub_channel = new brpc::Channel;
+    if (sub_channel->Init("bns://ns-node-1", "rr", NULL) != 0) {
+        LOG(ERROR) << "Fail to init sub channel";
+        return -1;
+    }
+
+    // SelectiveChannel always OWNS sub-channels (unlike ParallelChannel).
+    // The second parameter is an optional handle for later removal.
+    brpc::SelectiveChannel::ChannelHandle handle;
+    if (schan.AddChannel(sub_channel, &handle) != 0) {
+        LOG(ERROR) << "Fail to add sub channel";
+        return -1;
+    }
+
+    // Remove a sub-channel dynamically (safe even during active RPCs;
+    // takes effect at the next RPC):
+    schan.RemoveAndDestroyChannel(handle);
+    ```
+
+    Unlike `ParallelChannel`, `AddChannel` can be called at any time — even while RPCs are in progress. New channels take effect at the next RPC.
+
+    ### Example: Routing Across Multiple Naming Services
+
+    ```c++
+    brpc::SelectiveChannel channel;
+    brpc::ChannelOptions schan_options;
+    schan_options.timeout_ms = FLAGS_timeout_ms;
+    schan_options.max_retry = FLAGS_max_retry;
+    if (channel.Init("c_murmurhash", &schan_options) != 0) {
+        LOG(ERROR) << "Fail to init SelectiveChannel";
+        return -1;
+    }
+
+    // Add 3 sub-channels pointing to different naming service nodes.
+    for (int i = 0; i < 3; ++i) {
+        brpc::Channel* sub_channel = new brpc::Channel;
+        if (sub_channel->Init(ns_node_name[i], "rr", NULL) != 0) {
+            LOG(ERROR) << "Fail to init sub channel " << i;
+            return -1;
+        }
+        if (channel.AddChannel(sub_channel, NULL /*handle*/) != 0) {
+            LOG(ERROR) << "Fail to add sub channel to SelectiveChannel";
+            return -1;
+        }
+    }
+
+    // Use like any channel.
+    XXXService_Stub stub(&channel);
+    stub.FooMethod(&cntl, &request, &response, NULL);
+    ```
+
+    <Note>
+    `SelectiveChannel` overrides timeouts in its sub-channels. A sub-channel configured with 100ms timeout but the `SelectiveChannel` configured with 500ms will use 500ms as the effective timeout.
+    </Note>
+  </Tab>
+
+  <Tab title="PartitionChannel">
+    ## PartitionChannel
+
+    `PartitionChannel` is a specialized `ParallelChannel` that automatically routes to sharded backends by **partition index** encoded in the naming service tags. Instead of manually mapping partitions to sub-channels, you define how to parse partition tags and let bRPC do the rest.
+
+    Check [example/partition_echo_c++](https://github.com/apache/brpc/tree/master/example/partition_echo_c++/) for a working example.
+
+    ### Implement PartitionParser
+
+    Tags in the naming service encode partition information. Implement `PartitionParser` to decode them. In this example, tags follow the format `N/M` (partition index / total partitions):
+
+    ```c++
+    #include <brpc/partition_channel.h>
+
+    class MyPartitionParser : public brpc::PartitionParser {
+    public:
+        bool ParseFromTag(const std::string& tag, brpc::Partition* out) {
+            // Tag format: "N/M" — partition N of M total.
+            size_t pos = tag.find_first_of('/');
+            if (pos == std::string::npos) {
+                LOG(ERROR) << "Invalid tag=" << tag;
+                return false;
+            }
+            char* endptr = NULL;
+            out->index = strtol(tag.c_str(), &endptr, 10);
+            if (endptr != tag.data() + pos) {
+                LOG(ERROR) << "Invalid index=" << butil::StringPiece(tag.data(), pos);
+                return false;
+            }
+            out->num_partition_kinds = strtol(tag.c_str() + pos + 1, &endptr, 10);
+            if (endptr != tag.c_str() + tag.size()) {
+                LOG(ERROR) << "Invalid num=" << tag.data() + pos + 1;
+                return false;
+            }
+            return true;
+        }
+    };
+    ```
+
+    ### Initialize PartitionChannel
+
+    ```c++
+    brpc::PartitionChannel channel;
+
+    brpc::PartitionChannelOptions options;
+    options.protocol = brpc::PROTOCOL_BAIDU_STD;
+    options.timeout_ms = 1000;
+    // fail_limit=1: the overall RPC fails if any single partition fails.
+    options.fail_limit = 1;
+
+    if (channel.Init(3 /*num_partition_kinds*/, new MyPartitionParser(),
+                     "file://server_list", "rr", &options) != 0) {
+        LOG(ERROR) << "Fail to init PartitionChannel";
+        return -1;
+    }
+
+    // Use like any channel.
+    XXX_Stub stub(&channel);
+    stub.SomeMethod(&cntl, &request, &response, NULL);
+    ```
+
+    The naming service file `server_list` uses partition tags:
+
+    ```
+    10.0.0.1:8000  0/3
+    10.0.0.2:8000  1/3
+    10.0.0.3:8000  2/3
+    ```
+
+    ### DynamicPartitionChannel — Zero-Downtime Resharding
+
+    `PartitionChannel` supports only one partition scheme at a time. `DynamicPartitionChannel` supports **multiple schemes simultaneously** and routes traffic proportionally based on how many servers are healthy in each scheme. This allows seamless migration from one partition count to another without changing client code or restarting clients.
+
+    ```c++
+    brpc::DynamicPartitionChannel channel;
+    brpc::PartitionChannelOptions options;
+    options.fail_limit = 1;
+
+    if (channel.Init(new MyPartitionParser(), "file://server_list",
+                     "rr", &options) != 0) {
+        LOG(ERROR) << "Fail to init DynamicPartitionChannel";
+        return -1;
+    }
+    ```
+
+    With both 3-partition and 4-partition schemes active in `server_list`:
+
+    ```
+    # 3-partition scheme
+    10.0.0.1:8004  0/3
+    10.0.0.1:8004  1/3
+    10.0.0.1:8004  2/3
+
+    # 4-partition scheme (being migrated to)
+    10.0.0.2:8005  0/4
+    10.0.0.2:8005  1/4
+    10.0.0.2:8005  2/4
+    10.0.0.2:8005  3/4
+    ```
+
+    Traffic is split between the two schemes in proportion to their **capacity** (number of healthy server instances). Gradually adding servers to the 4-partition scheme and removing them from the 3-partition scheme migrates all traffic with no client-side changes.
+
+    **Capacity calculation rules:**
+    - A regular `Channel`'s capacity = sum of its servers' weights (1 by default)
+    - A `ParallelChannel`/`PartitionChannel`'s capacity = minimum of its sub-channels'
+    - A `SelectiveChannel`'s capacity = sum of its sub-channels'
+    - A `DynamicPartitionChannel`'s capacity = sum of its sub-`PartitionChannel`s'
+  </Tab>
+</Tabs>
+
+---
+
+## When to Use Each Combo Channel
+
+| Scenario | Channel Type |
+|----------|-------------|
+| Broadcast request to N backends, merge results | `ParallelChannel` |
+| Pick one of several clusters per RPC (HA, A/B) | `SelectiveChannel` |
+| Route to sharded backends by partition key, fixed scheme | `PartitionChannel` |
+| Migrate between partition schemes without downtime | `DynamicPartitionChannel` |
+| Multiple RPCs in parallel, wait for all (simple case) | Semi-synchronous with `brpc::Join` |

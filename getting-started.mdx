@@ -1,0 +1,333 @@
+---
+title: "Getting started"
+description: "Install bRPC's dependencies, build the library from source, and verify your setup by running the bundled echo example."
+---
+
+## Dependencies
+
+bRPC requires three libraries at build time:
+
+| Library | Purpose |
+|---|---|
+| [gflags](https://github.com/gflags/gflags) `2.0–2.2.2` | Global command-line flags throughout the framework |
+| [protobuf](https://github.com/google/protobuf) `3.0–5.29` | Message serialization and service interface definitions |
+| [leveldb](https://github.com/google/leveldb) | Required by `/rpcz` for recording RPCs for distributed tracing |
+
+Optional dependencies:
+
+- **openssl** `0.97–1.1` — Required for HTTPS/TLS support.
+- **gperftools / tcmalloc** — Enables the built-in CPU and heap profilers.
+- **googletest** — Required only if you want to run the test suite.
+
+## Supported compiler versions
+
+| Compiler | Supported versions | Notes |
+|---|---|---|
+| GCC | 4.8–11.2 | GCC 8.2+ preferred. Add `-D__const__=__unused__` to your `CXXFLAGS` to avoid errno issues with GCC 4+. C++11 is enabled by default. |
+| Clang | 3.5–4.0 | No known issues. |
+
+<Warning>
+  The over-aligned warnings introduced in GCC 7 are suppressed temporarily. Using GCC versions outside the supported range may generate additional warnings.
+</Warning>
+
+## Installation
+
+<Tabs>
+  <Tab title="Ubuntu / Debian / WSL">
+    <Steps>
+      <Step title="Install system dependencies">
+        Install the compiler toolchain, OpenSSL, and the required bRPC dependencies from the Ubuntu package manager:
+
+        ```bash
+        sudo apt-get install -y git g++ make libssl-dev \
+          libgflags-dev libprotobuf-dev libprotoc-dev \
+          protobuf-compiler libleveldb-dev
+        ```
+
+        If you need to statically link leveldb (required for some deployment configurations):
+
+        ```bash
+        sudo apt-get install -y libsnappy-dev
+        ```
+
+        To enable the built-in CPU and heap profilers:
+
+        ```bash
+        sudo apt-get install -y libgoogle-perftools-dev
+        ```
+
+        To run the test suite, install and compile `libgtest-dev`:
+
+        ```bash
+        sudo apt-get install -y cmake libgtest-dev
+        cd /usr/src/gtest
+        sudo cmake .
+        sudo make
+        sudo mv lib/libgtest* /usr/lib/
+        cd -
+        ```
+
+        <Note>
+          The gtest source directory may be at `/usr/src/googletest/googletest` on newer distributions.
+        </Note>
+      </Step>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/apache/brpc.git
+        cd brpc
+        ```
+      </Step>
+      <Step title="Build with config_brpc.sh">
+        ```bash
+        sh config_brpc.sh --headers=/usr/include --libs=/usr/lib
+        make
+        ```
+
+        Common optional flags:
+
+        | Flag | Effect |
+        |---|---|
+        | `--cxx=clang++ --cc=clang` | Use Clang instead of GCC |
+        | `--nodebugsymbols` | Strip debug symbols; significantly smaller binaries |
+        | `--with-glog` | Use glog instead of bRPC's built-in logging |
+        | `--with-thrift` | Enable Thrift protocol support (install Thrift first) |
+      </Step>
+      <Step title="Verify the build">
+        Run the echo example to confirm the build succeeded:
+
+        ```bash
+        cd example/echo_c++
+        make
+        ./echo_server &
+        ./echo_client
+        ```
+
+        You should see log output showing the client receiving echo responses from the server. Press Ctrl-C to stop the server.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="CentOS / Fedora">
+    <Steps>
+      <Step title="Install system dependencies">
+        On CentOS, enable EPEL first to make the required packages available:
+
+        ```bash
+        sudo yum install epel-release
+        ```
+
+        Install the compiler toolchain:
+
+        ```bash
+        sudo yum install git gcc-c++ make openssl-devel
+        ```
+
+        Install gflags, protobuf, and leveldb:
+
+        ```bash
+        sudo yum install gflags-devel protobuf-devel protobuf-compiler leveldb-devel
+        ```
+
+        To enable the built-in CPU and heap profilers:
+
+        ```bash
+        sudo yum install gperftools-devel
+        ```
+
+        To run the test suite:
+
+        ```bash
+        sudo yum install gtest-devel
+        ```
+      </Step>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/apache/brpc.git
+        cd brpc
+        ```
+      </Step>
+      <Step title="Build with config_brpc.sh">
+        On CentOS/Fedora, libraries are typically under `/usr/lib64` and binaries under `/usr/bin`:
+
+        ```bash
+        sh config_brpc.sh --headers="/usr/include" --libs="/usr/lib64 /usr/bin"
+        make
+        ```
+      </Step>
+      <Step title="Verify the build">
+        ```bash
+        cd example/echo_c++
+        make
+        ./echo_server &
+        ./echo_client
+        ```
+
+        You should see log output showing the client receiving echo responses from the server.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="macOS">
+    <Steps>
+      <Step title="Install dependencies via Homebrew">
+        bRPC requires a patched version of protobuf. Install it from the bundled Homebrew formula:
+
+        ```bash
+        brew install ./homebrew-formula/protobuf.rb
+        brew install openssl git gnu-getopt coreutils gflags leveldb
+        ```
+
+        To enable the built-in profilers:
+
+        ```bash
+        brew install gperftools
+        ```
+      </Step>
+      <Step title="Resolve OpenSSL path (Monterey and later)">
+        On macOS Monterey and later, Homebrew may install OpenSSL to a non-standard path. If you see OpenSSL-related errors during the build:
+
+        ```bash
+        brew link openssl --force
+        ```
+
+        If that does not create `/usr/local/opt/openssl`, create a symlink manually:
+
+        ```bash
+        sudo ln -s /opt/homebrew/Cellar/openssl@3/3.0.3 /usr/local/opt/openssl
+        ```
+
+        Check the actual installed path with `brew info openssl` first.
+      </Step>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/apache/brpc.git
+        cd brpc
+        ```
+      </Step>
+      <Step title="Build with config_brpc.sh">
+        ```bash
+        sh config_brpc.sh --headers=/usr/local/include --libs=/usr/local/lib \
+          --cc=clang --cxx=clang++
+        make
+        ```
+
+        If Homebrew installed packages to `/opt/homebrew` (Apple Silicon with newer Homebrew):
+
+        ```bash
+        sh config_brpc.sh --headers=/opt/homebrew/include --libs=/opt/homebrew/lib \
+          --cc=clang --cxx=clang++
+        make
+        ```
+      </Step>
+      <Step title="Verify the build">
+        ```bash
+        cd example/echo_c++
+        make
+        ./echo_server &
+        ./echo_client
+        ```
+      </Step>
+    </Steps>
+
+    <Warning>
+      macOS performance is lower than Linux due to OS-level differences in I/O and threading. Do not use macOS as a production environment for performance-critical services.
+    </Warning>
+  </Tab>
+
+  <Tab title="Docker">
+    <Steps>
+      <Step title="Clone the repository">
+        ```bash
+        mkdir -p ~/brpc
+        cd ~/brpc
+        git clone https://github.com/apache/brpc.git
+        cd brpc
+        ```
+      </Step>
+      <Step title="Build the Docker image">
+        ```bash
+        docker build -t brpc:master .
+        ```
+      </Step>
+      <Step title="Run a container">
+        ```bash
+        docker run -it brpc:master /bin/bash
+        ```
+
+        The container includes the full build environment with all dependencies pre-installed.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Building with CMake
+
+All platforms also support a CMake-based build. CMake 3.13 or later is required for the shorthand syntax.
+
+<CodeGroup>
+
+```bash CMake (standard)
+mkdir build && cd build && cmake .. && cmake --build . -j6
+```
+
+```bash CMake 3.13+ shorthand
+cmake -B build && cmake --build build -j6
+```
+
+</CodeGroup>
+
+Useful CMake options:
+
+| Option | Effect |
+|---|---|
+| `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` | Generate `compile_commands.json` for IDE/LSP tooling |
+| `-DWITH_DEBUG_SYMBOLS=OFF` | Strip debug symbols (remove `build/CMakeCache.txt` first) |
+| `-DWITH_GLOG=ON` | Use glog instead of bRPC's built-in logging |
+| `-DWITH_THRIFT=ON` | Enable Thrift protocol support |
+| `-DBUILD_UNIT_TESTS=ON` | Build the test suite |
+| `-DLINK_SO=ON` | Link examples against the shared library instead of static |
+
+To change the compiler to Clang, set environment variables before running CMake:
+
+```bash
+CC=clang CXX=clang++ cmake -B build && cmake --build build -j6
+```
+
+### Run the echo example with CMake
+
+```bash
+cd example/echo_c++
+cmake -B build && cmake --build build -j4
+./echo_server &
+./echo_client
+```
+
+## Building with vcpkg
+
+[vcpkg](https://github.com/microsoft/vcpkg) provides a cross-platform alternative that downloads and compiles all dependencies automatically:
+
+```bash
+git clone https://github.com/microsoft/vcpkg.git
+./bootstrap-vcpkg.sh   # use .bat on Windows PowerShell
+./vcpkg install brpc
+```
+
+## Running the test suite
+
+<Tabs>
+  <Tab title="Make">
+    ```bash
+    cd test
+    make
+    sh run_tests.sh
+    ```
+  </Tab>
+  <Tab title="CMake">
+    ```bash
+    mkdir build && cd build
+    cmake -DBUILD_UNIT_TESTS=ON ..
+    make
+    make test
+    ```
+  </Tab>
+</Tabs>
